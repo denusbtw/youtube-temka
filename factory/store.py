@@ -64,6 +64,8 @@ def connect():
             job TEXT NOT NULL, at REAL NOT NULL, state TEXT NOT NULL, detail TEXT)''')
         db.execute('''CREATE TABLE IF NOT EXISTS factory_settings (
             key TEXT PRIMARY KEY, value TEXT NOT NULL)''')
+        db.execute('''CREATE TABLE IF NOT EXISTS render_lineages (
+            id TEXT PRIMARY KEY, last_version INTEGER NOT NULL)''')
         yield db
 
 
@@ -81,14 +83,27 @@ def decode(row,db=None):
 
 def create(request):
     jid = uuid.uuid4().hex
+    result = {}
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
         if request.get('source','').startswith('edit:'):
-            origin=request['source'].split(':')[1]
+            _, origin, index_text = request['source'].split(':')
+            index = int(index_text)
             package=db.execute('SELECT state FROM retention_packages WHERE job=?',(origin,)).fetchone()
             if package and package['state'] in ('DELETION_PENDING','DELETED'):raise ValueError('Source package is being removed or has expired; restore it before editing')
-        db.execute('INSERT INTO jobs(id,state,request,created) VALUES(?,?,?,?)',
-                   (jid, 'QUEUED', json.dumps(request, ensure_ascii=False), time.time()))
+            parent = db.execute("SELECT result FROM jobs WHERE id=? AND state='READY'", (origin,)).fetchone()
+            outputs = json.loads(parent['result']).get('outputs', []) if parent else []
+            if not 0 <= index < len(outputs):
+                raise ValueError('Editable source output is unavailable')
+            parent_output = outputs[index]
+            parent_id = parent_output.get('render_id') or f'{origin}:{index+1}'
+            lineage = parent_output.get('render_lineage_id') or parent_id
+            version = db.execute('''INSERT INTO render_lineages(id,last_version) VALUES(?,?)
+                ON CONFLICT(id) DO UPDATE SET last_version=MAX(render_lineages.last_version+1,excluded.last_version)
+                RETURNING last_version''', (lineage, (parent_output.get('render_version') or 1)+1)).fetchone()[0]
+            result['edit_revision'] = {'render_lineage_id': lineage, 'parent_render_id': parent_id, 'render_version': version}
+        db.execute('INSERT INTO jobs(id,state,request,result,created) VALUES(?,?,?,?,?)',
+                   (jid, 'QUEUED', json.dumps(request, ensure_ascii=False), json.dumps(result), time.time()))
         db.execute('INSERT INTO events VALUES(?,?,?,?)',(jid,time.time(),'QUEUED','Job queued'))
     return get(jid)
 

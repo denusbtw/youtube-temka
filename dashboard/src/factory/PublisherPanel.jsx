@@ -3,6 +3,7 @@ import MetadataEditor from "./MetadataEditor.jsx";
 import PublicationEditor from "./PublicationEditor.jsx";
 export default function PublisherPanel({
   outputs,
+  initialSelection = "",
   settings,
   act,
   api,
@@ -11,7 +12,7 @@ export default function PublisherPanel({
 }) {
   const [data, setData] = useState({ channels: [], publications: [] }),
     [channel, setChannel] = useState(""),
-    [selected, setSelected] = useState(""),
+    [selected, setSelected] = useState(initialSelection),
     [privacy, setPrivacy] = useState("private"),
     [when, setWhen] = useState(""),
     [policy, setPolicy] = useState({

@@ -134,6 +134,7 @@ function App() {
   const [selected, setSelected] = useState(null),
     [edits, setEdits] = useState({});
   const [outputIndex,setOutputIndex]=useState(0);
+  const [publishSelection, setPublishSelection] = useState("");
   const [libraryQuery, setLibraryQuery] = useState("");
   const [libraryMode, setLibraryMode] = useState("all");
   const act = async (fn) => {
@@ -447,6 +448,7 @@ function App() {
                         </a>
                       )}
                       <h3>{o.title}</h3>
+                      {o.render_version && <small>Версія відео {o.render_version}</small>}
                       <MetadataEditor job={chosen} output={o} index={i} api={api} post={post} act={act} onSaved={refresh}/>
                       <OutputEditor
                         job={chosen}
@@ -480,6 +482,15 @@ function App() {
                           }
                         >
                           {o.approved ? "Скасувати схвалення" : "Схвалити"}
+                        </button>
+                        <button
+                          disabled={!o.approved || !o.drive || !chosen.result.cloud_verified}
+                          onClick={() => {
+                            setPublishSelection(`${chosen.id}:${i}`);
+                            setPage("Publish");
+                          }}
+                        >
+                          До публікації
                         </button>
                       </div>
                     </section>
@@ -664,7 +675,7 @@ function App() {
           </>
         )}
         {page === "Publish" && (
-          <PublisherPanel outputs={outputs} settings={settings} act={act} api={api} post={post} refreshJobs={refresh} />
+          <PublisherPanel outputs={outputs} initialSelection={publishSelection} settings={settings} act={act} api={api} post={post} refreshJobs={refresh} />
         )}
         {page === "Settings" && (
           <>

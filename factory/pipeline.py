@@ -210,6 +210,7 @@ def process(claim,assets=None):
             import hashlib
             with output.open('rb') as rendered:digest=hashlib.file_digest(rendered,'sha256').hexdigest()
             outputs[-1].update(render_id=f'{jid}:{i+1}',render_version=1,output_hash=digest,hook=clip_request.hook,hook_candidates=hook_candidates,series={'id':jid,'title':candidate.get('series_title',candidate['title']),'part':candidate['part'],'parts':candidate['parts'],'previous_part':candidate['part']-1 if candidate['part']>1 else None,'next_part':candidate['part']+1 if candidate['part']<candidate['parts'] else None} if candidate.get('part') else None)
+            outputs[-1].update(job['result'].get('edit_revision', {}))
             update(result={'outputs':outputs,'clips_completed':i+1,'clips_total':len(candidates)})
         if request.mode=='longs':
             timeline=manifest(candidates,request);position=0
@@ -227,6 +228,7 @@ def process(claim,assets=None):
             outputs=[{'name':final.name,'title':metadata['title'],'approved':False,'duration':validation['duration'],'edit_duration':sum(c['end_seconds']-c['start_seconds'] for c in candidates),'validation':validation,'thumbnail':{'name':thumb.name,**thumbnail_report}}]
             with final.open('rb') as rendered:digest=hashlib.file_digest(rendered,'sha256').hexdigest()
             outputs[0].update(render_id=f'{jid}:long',render_version=1,output_hash=digest)
+            outputs[0].update(job['result'].get('edit_revision', {}))
         from . import metadata as publishing_metadata
         from .editorial import assess
         contexts=[publishing_metadata.context(transcript,request,metadata,candidates if request.mode=='longs' else candidates[i:i+1],output,source_url) for i,output in enumerate(outputs)]

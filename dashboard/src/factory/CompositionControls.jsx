@@ -3,11 +3,18 @@ import React,{useEffect,useState} from 'react';
 export const layouts={auto:['Auto','Автоматичний вибір макета'],smart:['Fill Screen','Основне відео заповнює кадр'],crop:['Center Crop','Центральна частина кадру'],blur:['Blurred Sides','Основне відео на розмитому фоні'],gameplay:['Split Screen','Основне відео зверху, додаткове знизу']};
 export const textModes={none:'No Text',subtitles:'Subtitles',static_hook:'Static Hook',hook_subtitles:'Hook + Subtitles',custom:'Custom Text'};
 
+function BackgroundPreview({name}) {
+  const [useVideo,setUseVideo]=useState(false);
+  const source=`/api/library/backgrounds/${encodeURIComponent(name)}`;
+  if(useVideo) return <video src={source} aria-label="Прев’ю додаткового відео" muted playsInline preload="metadata" controls/>;
+  return <img src={`${source}/frame`} alt="Кадр додаткового відео" onError={()=>setUseVideo(true)}/>;
+}
+
 export function LayoutPreview({form,thumbnail,video}) {
   const split=form.preset==='gameplay',blur=form.preset==='blur',wide=form.mode==='longs';
   const frame=thumbnail ? <img src={thumbnail} alt="Кадр джерела"/> : video ? <video src={video} muted playsInline preload="metadata" controls/> : <span>Додайте джерело для перегляду кадру</span>;
   return <figure className="layout-preview"><div className={`layout-frame ${wide?'wide':''} ${blur?'blurred':''} ${split?'split':''}`}>
-    <div className="main-frame" style={split?{height:`${(form.split_ratio||.5)*100}%`}:undefined}>{frame}</div>{split&&<div className="secondary-frame" style={{height:`${(1-(form.split_ratio||.5))*100}%`}}>{form.background_mode==='none'?'Додаткове відео вимкнене':form.background?<img src={`/api/library/backgrounds/${form.background}/frame`} alt="Кадр додаткового відео"/>:'Додаткове відео з бібліотеки'}</div>}
+    <div className="main-frame" style={split?{height:`${(form.split_ratio||.5)*100}%`}:undefined}>{frame}</div>{split&&<div className="secondary-frame" style={{height:`${(1-(form.split_ratio||.5))*100}%`}}>{form.background_mode==='none'?'Додаткове відео вимкнене':form.background?<BackgroundPreview key={form.background} name={form.background}/>:'Додаткове відео з бібліотеки'}</div>}
     {['static_hook','hook_subtitles','custom'].includes(form.text_mode)&&<strong className="preview-hook" style={{top:form.hook_position==='center'?'45%':form.hook_position==='bottom'?'65%':'12%',color:form.hook_color||'#fff',background:form.hook_box===false?'transparent':'#000b',fontFamily:{sans:'sans-serif',serif:'serif',mono:'monospace'}[form.hook_font||'sans'],fontSize:Math.max(9,(form.hook_font_size||48)/6)}}>{form.hook||'Заголовок відео'}</strong>}
     {(form.text_mode?['subtitles','hook_subtitles'].includes(form.text_mode):form.captions)&&<span className="preview-subtitles">Приклад субтитрів</span>}
     {form.logo_asset&&<span className="preview-logo"><img src={`/api/library/logos/${form.logo_asset}`} alt="Лого" style={{width:'100%'}}/></span>}

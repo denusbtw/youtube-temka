@@ -179,6 +179,9 @@ def enqueue(jid,index,channel,title=None,description=None,privacy='private',publ
         current=db.execute('SELECT state,result FROM jobs WHERE id=?',(jid,)).fetchone()
         if not current or current['state']!='READY' or json.loads(current['result'])['outputs'][index]!=output:
             raise ValueError('Output or approval changed while queueing; refresh and review the current revision')
+        package=db.execute('SELECT state FROM retention_packages WHERE job=?',(jid,)).fetchone()
+        if package and package['state'] in ('DELETION_PENDING','DELETED'):
+            raise ValueError('The Drive package is being removed or has expired')
         policy=db.execute('SELECT * FROM channels WHERE id=?',(channel,)).fetchone()
         if not policy:
             raise ValueError('Select an authenticated YouTube channel')

@@ -42,7 +42,8 @@ def register(job):
 
 def protect(jid,value):
     with store.connect() as db:
-        if not db.execute('UPDATE retention_packages SET protected=? WHERE job=?',(int(value),jid)).rowcount:raise ValueError('Tracked package not found')
+        if not db.execute("UPDATE retention_packages SET protected=? WHERE job=? AND state='ACTIVE'",(int(value),jid)).rowcount:
+            raise ValueError('Protection can only be changed for an active package')
 
 
 def candidates(now=None):
@@ -76,15 +77,20 @@ def cleanup(dry_run=True):
     # renderer acquiring a preserved edit source. Remote references are rechecked.
     with _slot:
         policy=settings();items=candidates();eligible=[i for i in items if i['eligible']]
-        # Enabling "delete published" deletes eligible packages after grace;
-        # numeric pressure alone never deletes an ineligible package.
-        chosen=eligible if policy['enabled'] else eligible[:max(0,len(items)-policy['maximum_packages'])]
-        report={'dry_run':dry_run,'selected':[i['job'] for i in chosen],'deleted':[],'errors':[]}
+        limit=policy['maximum_packages']
+        pending=[i for i in eligible if i['state']=='DELETION_PENDING']
+        active=[i for i in eligible if i['state']!='DELETION_PENDING']
+        chosen=pending+active[:max(0,len(items)-len(pending)-limit)]
+        remaining=len(items)-len(chosen) if dry_run else len(items)
+        report={'dry_run':dry_run,'selected':[i['job'] for i in chosen] if dry_run else [],'deleted':[],'errors':[],
+                'remaining':remaining,'over_limit':max(0,remaining-limit)}
         if dry_run:return report
         if not policy['enabled']:raise ValueError('Enable Drive retention explicitly before applying cleanup')
-        for item in chosen:
+        for item in pending+active:
+            if item['state']!='DELETION_PENDING' and len(items)-len(report['deleted'])<=limit:break
             jid=item['job']
             if not next((i['eligible'] for i in candidates() if i['job']==jid),False):continue
+            report['selected'].append(jid)
             try:
                 with store.connect() as db:
                     pubs=[dict(r) for r in db.execute('SELECT p.*,c.alias FROM publications p JOIN channels c ON c.id=p.channel WHERE p.job=?',(jid,))]
@@ -109,6 +115,9 @@ def cleanup(dry_run=True):
                         protected=db.execute('SELECT protected FROM retention_packages WHERE job=?',(jid,)).fetchone()['protected']
                         active=db.execute("SELECT request FROM jobs WHERE state<>'READY'").fetchall()
                         if protected or any(json.loads(r['request']).get('source','').startswith('edit:'+jid+':') for r in active):raise ValueError('Package acquired a protected/active reference')
+                        current_pubs=[dict(r) for r in db.execute('SELECT p.*,c.alias FROM publications p JOIN channels c ON c.id=p.channel WHERE p.job=?',(jid,))]
+                        if {p['id']:p for p in current_pubs}!={p['id']:p for p in pubs}:
+                            raise ValueError('Publication changed during cleanup verification')
                         db.execute("UPDATE retention_packages SET state='DELETION_PENDING',error=NULL WHERE job=?",(jid,))
                     for file in files:
                         drive.request('PATCH',BASE+'/files/'+file['id'],params={'supportsAllDrives':'true'},json={'trashed':True})
@@ -122,8 +131,9 @@ def cleanup(dry_run=True):
             except Exception:
                 detail='Cleanup not completed; check channel verification, Drive ownership/permissions and active references, then retry'
                 with store.connect() as db:
-                    db.execute("UPDATE retention_packages SET state='DELETION_PENDING',error=? WHERE job=?",(detail,jid))
+                    db.execute('UPDATE retention_packages SET error=? WHERE job=?',(detail,jid))
                     db.execute('INSERT INTO retention_history VALUES(?,?,?,?)',(jid,time.time(),'FAILED',detail))
                 report['errors'].append({'job':jid,'error':detail})
         report['remaining']=len(items)-len(report['deleted'])
+        report['over_limit']=max(0,report['remaining']-limit)
         return report
