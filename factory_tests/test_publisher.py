@@ -362,3 +362,9 @@ def test_weak_selection_waits_for_editorial_approval_even_with_automatic_policy(
     assert publisher.history()==[]
     store.approve(jid,0,True)
     assert publisher.enqueue(jid,0,'channel-fixture','Reviewed title','',automatic=True)
+
+def test_deployment_can_disable_automatic_publication_before_oauth(monkeypatch):
+    from factory import config,publisher
+    monkeypatch.setattr(config,'AUTOMATIC_PUBLISHING',False)
+    with pytest.raises(ValueError,match='Automatic publishing is disabled'):
+        publisher.enqueue('does-not-matter',0,'channel',automatic=True)

@@ -1,6 +1,10 @@
 # Deployment and recovery
 
-For version 7 workflows and memory/retention behavior see [Factory 7](FACTORY_7.md).
+For workflow setup, job recovery and edit-plan behavior see [Factory 9](FACTORY_9.md).
+The controller and remote worker should run the same release. New job inputs and
+edit plans use the existing SQLite JSON columns. The upgrade keeps the current
+data, scratch and model volumes. Compose passes the optional
+`FACTORY_SHORTS_MAX_SECONDS` setting to both controller and worker.
 
 See `verification/REPORT.md` for actual acceptance evidence and remaining blockers.
 Existing Drive OAuth was found in the earlier Factory worktree and reused through

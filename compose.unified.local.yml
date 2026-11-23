@@ -1,0 +1,49 @@
+services:
+  controller:
+    image: factory80-staging-controller
+    gpus: all
+    ports:
+      - "127.0.0.1:28082:8000"
+    environment:
+      FACTORY_TOKEN: ${FACTORY89_CONTROLLER_TOKEN:?Set FACTORY89_CONTROLLER_TOKEN}
+      FACTORY_DATA: /data
+      FACTORY_SCRATCH: /scratch
+      FACTORY_HOST_LOCK_DIR: /host-locks
+      FACTORY_AUTOMATIC_PUBLISHING: "0"
+      FACTORY_PUBLISHER: "0"
+      FACTORY_ANALYTICS: "0"
+      FACTORY_VLM_ENABLED: "1"
+      OLLAMA_URL: http://host.docker.internal:11434
+      WHISPER_DEVICE: cpu
+      WHISPER_COMPUTE: int8
+      OMP_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "2"
+      FFMPEG_ENCODER: auto
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+      OLLAMA_GPU_LAYERS: auto
+      HF_HUB_OFFLINE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./factory:/app/factory:ro
+      - unified_data:/data
+      - unified_scratch:/scratch
+      - factory8_models:/home/factory/.cache:ro
+      - factory8_heavy_lock:/host-locks
+    mem_limit: 4g
+  web:
+    image: factory80-staging-web
+    ports:
+      - "127.0.0.1:25175:80"
+    volumes:
+      - ./dashboard/dist:/usr/share/nginx/html:ro
+    depends_on:
+      - controller
+volumes:
+  unified_data:
+  unified_scratch:
+  factory8_models:
+    external: true
+    name: factory80-staging_controller_models
+  factory8_heavy_lock:
+    external: true
+    name: factory80-staging-locks

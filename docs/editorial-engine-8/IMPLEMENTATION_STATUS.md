@@ -1,0 +1,21 @@
+# Factory 8.0 — Implementation Status Tracker
+
+Status vocabulary: `NOT_STARTED` | `IN_PROGRESS` | `IMPLEMENTED` | `TECHNICALLY_TESTED` | `EDITORIALLY_VERIFIED` | `BLOCKED`
+
+| Phase | Component | Status | Evidence / Notes |
+|---|---|---|---|
+| Phase 0 | Active Factory Pipeline Audit | `IMPLEMENTED` | Audited all core `factory/*.py`, `deploy/factory.Dockerfile`, `requirements-factory.lock`, `dashboard/src/factory/*.jsx` |
+| Phase 0 | Legacy OpenShorts & External Reuse Audit | `IMPLEMENTED` | Verified MIT core vs AGPL-3.0 (`clips-studio`, `reelsaw`); reuse matrix in `UPSTREAM_REUSE_AUDIT.md` |
+| Phase 1 | Reproducible Editorial Benchmark (`factory/benchmark.py`) | `TECHNICALLY_TESTED` | Schema v2 evaluator, GTA regression fixture (`verification/benchmarks/gta_yux8s3lwLss_v2.json`), baseline vs Factory 8.0 metrics evaluated |
+| Phase 2 | Unified Source Intelligence (`factory/source_intelligence.py`) | `TECHNICALLY_TESTED` | Single sequential PyAV pass (19.6 s on 618 s source, 101 shots, 1236 audio events, HUD/facecam/text-band cues, cached `source-evidence-v1.json`) |
+| Phase 3 | Semantic Event Graph (`factory/semantic_events.py`) | `TECHNICALLY_TESTED` | Shot continuity graph, 17/17 GTA format breaks detected (`title_card`, `interstitial`, `death_fail_screen`, `black_screen`, `graphic_stinger`, `end_card`), anti-padding refinement |
+| Phase 4 | Practical Multimodal Vision (`factory/vision_vlm.py`) | `TECHNICALLY_TESTED` | Local Ollama `qwen3-vl:2b-instruct` (Apache 2.0) benchmarked empirically on RTX 3050 4 GB: 2673 MiB peak VRAM, 3.05 s median latency, 100% schema validity, 100% format-break recall, 0 failures + CV fallback |
+| Phase 5 | Multi-Stage Highlight Discovery & Ranking (`factory/discovery.py`) | `TECHNICALLY_TESTED` | Map → Pool → Verify → Score (12-dim rubric) → Pairwise Rank (order-swapped bias mitigation) → Select; Independent/Connected/Sequential preserved |
+| Phase 6 | Intelligent Editing & EditManifest (`factory/edit_manifest.py`, `framing.py`, `media.py`) | `TECHNICALLY_TESTED` | Versioned `EditManifest` v1, source-aware layouts (`source_fit_blur`, `gameplay_facecam`, `two_speaker_split`, `fullscreen_smart_crop`, `gameplay_split`), scene-aware per-shot crops, 5 design presets, safe-area hooks |
+| Phase 7 | Contextual Metadata & Hook Intelligence (`metadata.py`, `hooks.py`, `drafts.py`) | `TECHNICALLY_TESTED` | Grounded event-specific titles/tags/descriptions from verified visual observations + transcript, manual edits preserved on regeneration, word-boundary truncation |
+| Phase 8 | Editorial Review UX & Feedback Persistence (`api.py`, `store.py`, React UI) | `TECHNICALLY_TESTED` | Visual shot/event/format-break timeline, evidence/defect badges, split/merge/trim controls, `POST /api/jobs/{jid}/feedback`, explicit editorial workflow states, Vite build passing |
+| Phase 9 | Business, Rights & Monetization Readiness | `TECHNICALLY_TESTED` | Additive `source_rights`, `editorial_feedback`, `production_metrics` SQLite tables, reused-content notice, automatic publishing disabled (`FACTORY_AUTOMATIC_PUBLISHING=0`) |
+| Phase 10 | Performance Engineering & Resource Bounds | `TECHNICALLY_TESTED` | Single-composite-grid VLM inference keeps peak VRAM at 2673–2736 MiB on RTX 3050 4 GB (0 OOMs), `/api/ps` VRAM residency check, persistent evidence & VLM caching |
+| Phase 11 | Exhaustive Editorial Acceptance & Full GTA Evaluation | `TECHNICALLY_TESTED` | 30/30 mandatory regression scenarios pass; full 618 s GTA reanalysis achieved 0% end-card/title-card contamination, 0% unrelated-scene merges, 3 rendered MP4s + 6-frame visual storyboards inspected; awaiting final human editorial sign-off |
+| Phase 11 | Multi-Source Annotated Holdout Benchmark (15–20 sources) | `BLOCKED` | External authorized multi-genre long-form media and human annotators are not present locally; infrastructure ready |
+| Phase 12 | Integration, CI & Release Candidate | `TECHNICALLY_TESTED` | Full backend suite (254/254 `factory_tests` green), Windows retained MIT suite (42/42), PowerShell launcher/updater/maintenance (15/15), Vite factory build, `compileall`, secret scan, and Docker Compose (CPU + GPU) all passed; pushed to `feat/factory-quality-rebuild` |

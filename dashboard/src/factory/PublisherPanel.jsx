@@ -3,15 +3,16 @@ import MetadataEditor from "./MetadataEditor.jsx";
 import PublicationEditor from "./PublicationEditor.jsx";
 export default function PublisherPanel({
   outputs,
+  initialSelection = "",
   settings,
   act,
   api,
   post,
   refreshJobs,
 }) {
-  const [data, setData] = useState({ channels: [], publications: [] }),
+  const [data, setData] = useState({ channels: [], publications: [], profiles: [] }),
     [channel, setChannel] = useState(""),
-    [selected, setSelected] = useState(""),
+    [selected, setSelected] = useState(initialSelection),
     [privacy, setPrivacy] = useState("private"),
     [when, setWhen] = useState(""),
     [policy, setPolicy] = useState({
@@ -39,6 +40,7 @@ export default function PublisherPanel({
   const chooseChannel = (id) => {
     setChannel(id);
     const c = data.channels.find((c) => c.id === id);
+    if (c?.managed_profile) {setPrivacy("private");setWhen("");}
     if (c)
       setPolicy({
         ...c,
@@ -52,6 +54,11 @@ export default function PublisherPanel({
   };
   const available = outputs.filter((o) => o.job.result.cloud_verified);
   const current = available.find((o) => `${o.job.id}:${o.index}` === selected);
+  const destination = data.channels.find(c => c.id === channel);
+  const managed = destination?.managed_profile;
+  const compatible = (!current?.job.request.publish_channel || current.job.request.publish_channel === channel) &&
+    (!current?.job.request.youtube_channel_key || current.job.request.youtube_channel_key === managed?.channel_key);
+  const destinationReady = !!destination && (!managed || (managed.enabled && managed.status === "CONNECTED"));
   const change = (key, value) => setPolicy((p) => ({ ...p, [key]: value }));
   const preference = (key, value) =>
     setPolicy((p) => ({
@@ -90,6 +97,29 @@ export default function PublisherPanel({
         >
           Перевірити OAuth і знайти канали
         </button>
+        {(data.profiles || []).map(profile => (
+          <article key={profile.channel_key}>
+            <b>{profile.title}</b>
+            <p>{profile.enabled ? profile.status : "DISCONNECTED"} · {profile.channel_id || "ID очікує OAuth"} · {profile.profile} · {profile.mode === "shorts" ? "Shorts" : "Long-form"}</p>
+            {profile.verified_at && <p>Остання перевірка: {calendarTime(profile.verified_at * 1000)}</p>}
+            {profile.error && <p className="warning">{profile.error}</p>}
+            <details>
+              <summary>{profile.channel_id ? "Перепідключити OAuth" : "Підключити OAuth"}</summary>
+              <p>Запустіть команду на ПК з Desktop OAuth client JSON. У Google виберіть саме цей YouTube-канал.</p>
+              <code>python -m factory.youtube_oauth --client PATH_TO_CLIENT.json --channel-key {profile.channel_key}{profile.channel_id ? " --reconnect" : ""}</code>
+              <p>Для окремого дозволу Analytics додайте <code>--analytics</code>. Після згоди перевірте підключення.</p>
+            </details>
+            <button onClick={() => act(async () => {
+              const result=await post(`/youtube/profiles/${profile.channel_key}/verify`);
+              await refresh();
+              if(result.error)throw new Error(result.error);
+            })}>Перевірити профіль</button>
+            {profile.channel_id && <button onClick={() => act(async () => {
+              await post(`/youtube/profiles/${profile.channel_key}/state`,{enabled:!profile.enabled});
+              await refresh();
+            })}>{profile.enabled ? "Відключити в Factory" : "Увімкнути в Factory"}</button>}
+          </article>
+        ))}
         <details>
           <summary>Одноразове підключення</summary>
           <p>
@@ -174,6 +204,7 @@ export default function PublisherPanel({
               <input
                 type="checkbox"
                 checked={!!policy.public_allowed}
+                disabled={!!managed}
                 onChange={(e) => change("public_allowed", e.target.checked)}
               />
               Я дозволяю публічні й заплановані публікації на цьому каналі
@@ -182,6 +213,7 @@ export default function PublisherPanel({
               <input
                 type="checkbox"
                 checked={!!policy.automatic}
+                disabled={!!managed}
                 onChange={(e) => change("automatic", e.target.checked)}
               />
               Увімкнути автоматичну чергу для явно вибраних завдань
@@ -285,7 +317,7 @@ export default function PublisherPanel({
             <button
               className="primary"
               disabled={
-                !channel || !current.approved || !current.publishing_metadata
+                !destinationReady || !compatible || !current.approved || !current.publishing_metadata
               }
               onClick={() =>
                 act(async () => {
@@ -335,9 +367,10 @@ export default function PublisherPanel({
         <section key={p.id}>
           <b>{p.metadata.snippet.title}</b>
           <p>
-            {p.state} ·{" "}
+            {data.channels.find(c=>c.id===p.channel)?.title || p.channel} · {p.metadata.format || "—"} · {p.state} ·{" "}
             {p.metadata.status.publishAt || p.metadata.status.privacyStatus}
           </p>
+          {p.video_id && <p>YouTube ID: {p.video_id}</p>}
           {p.total > 0 && (
             <>
               <progress value={p.current} max={p.total} />

@@ -38,6 +38,24 @@ def test_readiness_json_is_compatible_with_case_insensitive_clients(client,monke
     assert set(result['services'])=={'local_worker','publisher','analytics'}
 
 
+def test_compilation_preflight_reports_each_source(client,monkeypatch):
+    from factory import media
+    def probe(source):
+        if source.endswith('missing.mp4'):
+            raise ValueError('Uploaded source is missing')
+        return {'duration':600,'resolutions':[720],'platform':'local','title':'Owned fixture'}
+    monkeypatch.setattr(media,'probe',probe)
+    body={'source':'upload:owned.mp4','sources':[{'source':'upload:owned.mp4'},{'source':'upload:missing.mp4'}],
+          'rights_confirmed':True,'workflow':'compilation'}
+    assert client.post('/api/preflight',json=body).status_code==401
+    client.headers['Authorization']='Bearer '+'a'*40
+    response=client.post('/api/preflight',json=body)
+    assert response.status_code==200
+    assert response.json()['ready'] is False
+    assert response.json()['sources'][0]['selected_seconds']==600
+    assert response.json()['sources'][1]['error']=='Uploaded source is missing'
+
+
 def test_invalid_sources_and_rights(client):
     client.headers['Authorization']='Bearer '+'a'*40
     for url in ['http://127.0.0.1','https://youtube.com.attacker.invalid/x','file:///etc/passwd','https://twitch.tv@127.0.0.1/x']:
@@ -120,3 +138,79 @@ def test_retry_keeps_original_asset_version_and_automatic_choice(client):
     assert second['assets']==first['assets']
     assert second['assets'][0]['name']=='original.mp4'
     assert store.get(job['id'])['result']['asset_manifest']==first['assets']
+
+def test_job_visibility_bulk_restore_and_active_protection(client):
+    from factory import store
+    client.headers['Authorization']='Bearer '+'a'*40
+    requests={'source':'https://www.youtube.com/watch?v=fixture','rights_confirmed':True}
+    first=store.create(requests)
+    second=store.create(requests)
+    first_claim=store.claim('fixture')
+    store.update(first['id'],first_claim['lease'],state='READY')
+    response=client.post('/api/jobs/visibility',json={'ids':[first['id'],second['id']],'status':'archived'})
+    assert response.status_code==409
+    assert client.get('/api/jobs/'+first['id']).json()['visibility']=='recent'
+    second_claim=store.claim('fixture')
+    store.update(second['id'],second_claim['lease'],state='FAILED')
+    for status in ('archived','trash','recent'):
+        assert client.post('/api/jobs/visibility',json={'ids':[first['id'],second['id']],'status':status}).status_code==200
+        assert client.get('/api/jobs/'+first['id']).json()['visibility']==status
+    preview=client.get('/api/jobs/'+first['id']+'/deletion-preview').json()
+    assert preview['permanent_delete_available'] is False
+    assert preview['publications']==preview['dependent_edits']==0
+
+def test_empty_trashed_record_requires_confirmation_and_protects_workspace(client):
+    from factory import store,config
+    client.headers['Authorization']='Bearer '+'a'*40
+    job=store.create({'source':'https://www.youtube.com/watch?v=fixture','rights_confirmed':True})
+    jid=job['id']
+    claim=store.claim('fixture')
+    store.update(jid,claim['lease'],state='FAILED')
+    assert client.post('/api/jobs/visibility',json={'ids':[jid],'status':'trash'}).is_success
+    endpoint='/api/jobs/'+jid
+    assert client.post(endpoint+'/delete-record',json={'confirmation':'no'}).status_code==422
+    workspace=config.SCRATCH/jid
+    workspace.mkdir()
+    assert client.post(endpoint+'/delete-record',json={'confirmation':jid}).status_code==409
+    workspace.rmdir()
+    assert client.get(endpoint+'/deletion-preview').json()['permanent_delete_available']
+    assert client.post(endpoint+'/delete-record',json={'confirmation':jid}).status_code==200
+    assert client.get(endpoint).status_code==404
+
+def test_history_paginates_and_filters_archived_rows(client):
+    from factory import store
+    client.headers['Authorization']='Bearer '+'a'*40
+    source={'source':'https://www.youtube.com/watch?v=history-fixture','rights_confirmed':True}
+    for _ in range(3):
+        job=store.create(source)
+        claim=store.claim('fixture')
+        store.update(job['id'],claim['lease'],state='READY')
+    assert client.post('/api/jobs/visibility',json={'ids':[job['id']],'status':'archived'}).is_success
+    page=client.get('/api/job-history?limit=1&search=HISTORY-FIXTURE').json()
+    assert len(page['items'])==1 and page['has_more']
+    assert page['items'][0]['id']!=job['id']
+    archive=client.get('/api/job-history?scope=archived').json()
+    assert [row['id'] for row in archive['items']]==[job['id']]
+
+
+def test_story_can_fork_manual_replan_using_the_saved_transcript(client, monkeypatch):
+    from factory import media, store
+    from factory.models import JobRequest
+
+    client.headers['Authorization'] = 'Bearer ' + 'a'*40
+    source = 'upload:owned.mp4'
+    request = JobRequest(source=source, rights_confirmed=True, workflow='story',
+                         workflow_version=2, story_mode='chronological', save_drive=False)
+    original = store.create(request.model_dump())
+    workspace = config.SCRATCH / original['id']
+    workspace.mkdir(parents=True)
+    (workspace/'transcript.json').write_text('{"language":null,"segments":[]}', encoding='utf-8')
+    claim = store.claim('fixture')
+    store.update(original['id'], claim['lease'], state='READY')
+    monkeypatch.setattr(media, 'local_source', lambda _: workspace/'owned.mp4')
+    response = client.post('/api/jobs/'+original['id']+'/replan', json={'intervals':[[0,35]]})
+    assert response.status_code == 201, response.text
+    job = response.json()
+    assert job['request']['intervals'] == [[0,35]]
+    assert job['request']['workflow'] is None
+    assert (config.SCRATCH/job['id']/'transcript.json').is_file()

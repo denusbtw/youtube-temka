@@ -1,6 +1,7 @@
 x-worker-environment: &worker-environment
   FACTORY_DATA: /data
   FACTORY_SCRATCH: /scratch
+  FACTORY_AUTOMATIC_PUBLISHING: "0"
   FACTORY_TOKEN: ${FACTORY_TOKEN:-}
   SCRATCH_GB: ${SCRATCH_GB:-8}
   FREE_RESERVE_GB: ${FREE_RESERVE_GB:-4}
@@ -9,6 +10,7 @@ x-worker-environment: &worker-environment
   WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
   WHISPER_COMPUTE: ${WHISPER_COMPUTE:-int8}
   ASR_CHUNK_SECONDS: ${ASR_CHUNK_SECONDS:-300}
+  FACTORY_SHORTS_MAX_SECONDS: ${FACTORY_SHORTS_MAX_SECONDS:-180}
   OMP_NUM_THREADS: '2'
   OPENBLAS_NUM_THREADS: '2'
   MKL_NUM_THREADS: '2'
@@ -54,6 +56,8 @@ services:
     environment:
       <<: *worker-environment
       WORKER_ID: ${CONTROLLER_WORKER_ID:-worker-a}
+      FACTORY_MANAGED_YOUTUBE_DIR: /run/secrets/youtube-managed/upload
+      FACTORY_MANAGED_ANALYTICS_DIR: /run/secrets/youtube-managed/analytics
     ports: ['${API_BIND:-127.0.0.1}:8000:8000']
     volumes:
       - controller_data:/data

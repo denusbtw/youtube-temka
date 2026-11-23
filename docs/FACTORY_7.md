@@ -37,7 +37,9 @@ exports preserve their raw editable intervals on disk; Drive exports preserve
 verified editable files on Drive. Older results without those sources need an
 original-source upload. The previous successful video remains intact, and the
 new MP4 is registered only after temporary-output validation. Approval is bound
-to the render identity. Revoking approval also blocks a claimed upload before
+to the render identity. New edits reserve a version number in SQLite when queued.
+Concurrent edits of the same render lineage get distinct numbers and retries
+keep their number. Failed or cancelled edits can leave gaps. Revoking approval also blocks a claimed upload before
 network work begins.
 
 ## Languages and profiles
@@ -87,10 +89,14 @@ availability. Reimported identical files reuse the existing asset. New custom
 uploads default to an explicit operator-rights statement rather than a fabricated
 license grant. Additional license/category information can be supplied through
 the upload API. Background selection supports none, specific and random category.
-Secondary video is not mapped into the output audio track.
+When the server is busy generating a preview frame, the editor can preview the
+selected background as muted video in the browser. Secondary video is not
+mapped into the output audio track.
 
 ## Publishing
 
+In Editor, use **До публікації** to open publishing controls for the approved,
+Drive-verified output. Visibility starts at Private and queueing requires confirmation.
 Manual Public requires the exact approved render, an authenticated matching
 channel, per-channel public permission and a final channel/visibility confirmation.
 It is independent of automatic publishing, which remains off by default.
@@ -109,8 +115,9 @@ Real public publication remains an explicit operator action, separate from tests
 The unit is a completed package, including final videos, editable sources,
 metadata, subtitles and previews. Default deletion is OFF, retained limit 50,
 grace period 7 days. Dry-run never changes Drive. Protection and history are in
-Settings. Enabling deletion permits eligible published packages to be moved to
-Drive trash after the grace period. Permanent Drive deletion is not used.
+Settings. Enabling deletion lets Factory move eligible published packages to
+Drive trash after the grace period, starting with the oldest until the package
+limit is reached. Dry-run reports any projected excess after cleanup.
 
 Eligibility requires every output's verified public publication, elapsed grace,
 no pending/uncertain schedules, no active edit references and no protection.

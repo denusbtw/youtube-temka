@@ -42,6 +42,18 @@ def test_cancellation_releases_reader_with_full_log_queue(monkeypatch):
     assert not (set(threading.enumerate()) - before)
 
 
+def test_media_progress_does_not_rescan_scratch_per_log_line(monkeypatch):
+    checks = []
+    progress = []
+    monkeypatch.setattr(media, 'preflight', lambda: checks.append(True))
+    media.run([sys.executable, '-c',
+               "for i in range(1000): print('out_time_us='+str(i))"],
+              tick=lambda current, _: progress.append(current) if current is not None else None,
+              timeout=15)
+    assert 2 <= len(checks) < 20
+    assert len(progress) == 1000 and progress[-1] == .000999
+
+
 def test_asr_retry_keeps_small_chunks_and_reuses_completed_checkpoint(tmp_path, monkeypatch):
     monkeypatch.setattr(config, 'AUDIO_CHUNK_SECONDS', 300)
     root = tmp_path/'job'

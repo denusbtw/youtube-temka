@@ -15,6 +15,13 @@ from . import config
 from .resources import preflight
 
 
+class MediaFailure(RuntimeError):
+    def __init__(self, code, message, retryable=False):
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+
+
 def ffmpeg():
     if os.environ.get('FFMPEG_BINARY'):
         return os.environ['FFMPEG_BINARY']
@@ -24,9 +31,9 @@ def ffmpeg():
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-def run(args, tick=lambda *_:None, duration=None, timeout=7200, env=None):
+def run(args, tick=lambda *_:None, duration=None, timeout=7200, env=None, cwd=None):
     group={'creationflags':subprocess.CREATE_NEW_PROCESS_GROUP} if os.name=='nt' else {'start_new_session':True}
-    process=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,encoding='utf-8',errors='replace',env=env,**group)
+    process=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,encoding='utf-8',errors='replace',env=env,cwd=cwd,**group)
     # Backpressure bounds logs even if a child is noisy or progress persistence
     # is slow. readline's size also bounds a child that never writes a newline.
     lines=queue.Queue(maxsize=128)
@@ -47,39 +54,66 @@ def run(args, tick=lambda *_:None, duration=None, timeout=7200, env=None):
     thread=threading.Thread(target=read,daemon=True)
     thread.start()
     started=time.monotonic()
+    next_check=started
     tail=deque(maxlen=12)
+    progress=None
+    eof=False
     try:
         while True:
-            preflight()
-            tick(None,duration)
-            if time.monotonic()-started > timeout:
-                raise TimeoutError('Media operation timed out; shorten the interval and retry')
+            now=time.monotonic()
+            if now-started > timeout:
+                raise MediaFailure('MEDIA_TIMEOUT', 'Media operation timed out; check the source connection or shorten the interval.', True)
+            if now>=next_check:
+                preflight()
+                tick(None,duration)
+                next_check=time.monotonic()+1
+            if eof:
+                if process.poll() is not None:break
+                time.sleep(.1)
+                continue
             try:
                 line=lines.get(timeout=.25)
             except queue.Empty:
                 continue
             if line is None:
-                break
+                eof=True
+                continue
             tail.append(line)
             if line.startswith('out_time_us='):
                 try:
-                    tick(float(line.split('=')[1])/1e6,duration)
+                    progress=float(line.split('=')[1])/1e6
+                    tick(progress,duration)
                 except ValueError:
                     pass
             elif 'Transcribing' in line and duration:
                 import re
                 measured=re.search(r'Transcribing.*?(\d+)%',line)
-                if measured:tick(min(100,int(measured[1]))/100*duration,duration)
-        if process.wait() != 0:
+                if measured:
+                    progress=min(100,int(measured[1]))/100*duration
+                    tick(progress,duration)
+        if process.returncode != 0:
             # Do not return raw downloader logs: URLs may carry credentials.
             diagnostic=' '.join(tail).casefold()
-            if any(value in diagnostic for value in ('cuda out of memory','cuda_error_out_of_memory')):reason='GPU memory exhausted; use a smaller model or wait for GPU memory to be released'
-            elif 'out of memory' in diagnostic or 'cannot allocate memory' in diagnostic:reason='System/container memory exhausted; shorten the chunk or choose a smaller model'
-            elif 'no space left on device' in diagnostic:reason='Disk space exhausted; free scratch storage and retry'
-            elif any(value in diagnostic for value in ('downloaded range is empty', 'downloaded range is not decodable', 'downloaded range contains no decodable media')):reason='Source interval returned empty or incomplete media; retry the interval or check VOD availability'
-            elif process.returncode in (-9,137):reason='Process killed; inspect container OOM diagnostics and available RAM before retrying'
-            else:reason='Check codec support, source accessibility and available disk space'
-            raise RuntimeError(f'Media process failed (exit {process.returncode}). {reason}. Checkpoints preserved.')
+            code='MEDIA_PROCESS_FAILED';retryable=False
+            if any(value in diagnostic for value in ('cuda out of memory','cuda_error_out_of_memory')):
+                code,reason='GPU_MEMORY', 'GPU memory exhausted; use a smaller model or wait for GPU memory to be released'
+            elif 'out of memory' in diagnostic or 'cannot allocate memory' in diagnostic:
+                code,reason='SYSTEM_MEMORY', 'System/container memory exhausted; shorten the chunk or choose a smaller model'
+            elif 'no space left on device' in diagnostic:
+                code,reason='DISK_SPACE', 'Disk space exhausted; free scratch storage and retry'
+            elif any(value in diagnostic for value in ('http error 429','429 too many requests','server returned 429')):
+                code,reason,retryable='DOWNLOAD_RATE_LIMITED','Source rate limited the request; wait before retrying',True
+            elif any(value in diagnostic for value in ('connection timed out','connection reset','temporarily unavailable','http error 503','server returned 5')):
+                code,reason,retryable='SOURCE_UNAVAILABLE','Source connection was interrupted; verify the connection if retries fail',True
+            elif any(value in diagnostic for value in ('downloaded range is empty', 'downloaded range is not decodable', 'downloaded range contains no decodable media')):
+                code,reason,retryable='SOURCE_RANGE_INCOMPLETE','Source interval returned empty or incomplete media; check VOD availability',True
+            elif process.returncode in (-9,137):
+                code,reason='MEDIA_PROCESS_KILLED','Process killed; inspect container OOM diagnostics and available RAM before retrying'
+            else:
+                reason='Check codec support, source accessibility and available disk space'
+            raise MediaFailure(code, f'Media process failed (exit {process.returncode}). {reason}. Checkpoints preserved.', retryable)
+        preflight()
+        tick(None,duration)
     finally:
         stopped.set()
         if process.poll() is None:
@@ -98,6 +132,8 @@ def run(args, tick=lambda *_:None, duration=None, timeout=7200, env=None):
 
 
 def local_source(source):
+    if isinstance(source, Path):
+        return source if source.is_file() else None
     if source.startswith('job-local:'):
         import re
         jid=source.split(':',1)[1]
@@ -163,8 +199,16 @@ def probe(source):
     validate_url(source)
     import yt_dlp
     import ssrf_guard
-    with ssrf_guard.guarded(), yt_dlp.YoutubeDL({'quiet':True,'noplaylist':True,'socket_timeout':20,'skip_download':True}) as ydl:
-        item=ydl.extract_info(source,download=False)
+    try:
+        with ssrf_guard.guarded(), yt_dlp.YoutubeDL({'quiet':True,'noplaylist':True,'socket_timeout':20,'skip_download':True}) as ydl:
+            item=ydl.extract_info(source,download=False)
+    except yt_dlp.utils.DownloadError as error:
+        detail=str(error).casefold()
+        if '429' in detail and ('http' in detail or 'too many requests' in detail):
+            raise MediaFailure('DOWNLOAD_RATE_LIMITED','Source rate limited the request; wait before retrying.',True) from None
+        if any(word in detail for word in ('timed out','connection reset','http error 503')):
+            raise MediaFailure('SOURCE_UNAVAILABLE','Could not reach the source. Check the connection.',True) from None
+        raise MediaFailure('SOURCE_ACCESS_FAILED','Could not access the media. Verify the URL, privacy and source availability.') from None
     if item.get('is_live') or item.get('live_status') in ('is_live','is_upcoming'):
         raise ValueError('Only completed VODs are supported')
     if not item.get('duration'):
@@ -174,9 +218,9 @@ def probe(source):
 
 
 def download(source,path,start,end,resolution,audio=False,tick=lambda *_:None):
-    """Never fall back to downloading the full remote VOD."""
+    """Retrieve a bounded interval from a validated URL or internal local file."""
     preflight()
-    local=local_source(source)
+    local=source if isinstance(source,Path) else local_source(source)
     if local:
         args=[ffmpeg(),'-hide_banner','-loglevel','error','-y','-threads','2','-ss',str(start),'-i',str(local),'-t',str(end-start),'-threads','2','-filter_threads','1']
         if audio:
@@ -195,27 +239,42 @@ def download(source,path,start,end,resolution,audio=False,tick=lambda *_:None):
     return path
 
 
-def render(source,output,transcript,start,end,request,background=None,tick=lambda *_:None,stage=None,music_path=None,logo_path=None):
+def render(source,output,transcript,start,end,request,background=None,tick=lambda *_:None,stage=None,music_path=None,logo_path=None,candidate_meta=None,design_preset=None):
     from .heavy import HEAVY_LOCK
     with HEAVY_LOCK:
-        return _render(source,output,transcript,start,end,request,background,tick,stage,music_path,logo_path)
+        return _render(source,output,transcript,start,end,request,background,tick,stage,music_path,logo_path,candidate_meta=candidate_meta,design_preset=design_preset)
 
 
-def _render(source,output,transcript,start,end,request,background=None,tick=lambda *_:None,stage=None,music_path=None,logo_path=None):
+def _render(source,output,transcript,start,end,request,background=None,tick=lambda *_:None,stage=None,music_path=None,logo_path=None,candidate_meta=None,design_preset=None):
     from subtitles import generate_ass, generate_srt
     from ffmpeg_utils import video_encode_args, escape_filter_value, LOUDNORM_FILTER
-    # Loudnorm alone can overshoot after AAC encoding, especially for transient
-    # synthetic speech. Limit at the final sample rate with makeup gain disabled.
-    audio_filter=f'{LOUDNORM_FILTER},aformat=sample_rates=48000:channel_layouts=stereo,alimiter=limit=0.707945:level=false:latency=true'
+    from .edit_manifest import build_edit_manifest, facecam_crop_filter
+    # Single-pass loudnorm ramps up slowly when a clip starts with quiet speech or ambient
+    # dialogue (leaving Part 1 ~4 LU quieter than Part 2). A gentle dynaudnorm pre-stage
+    # levels speech/action dynamics before loudnorm, and the final alimiter prevents AAC
+    # inter-sample peak overshoot with makeup gain disabled.
+    audio_filter=f'dynaudnorm=f=250:g=15:p=0.9:m=10.0,{LOUDNORM_FILTER},aformat=sample_rates=48000:channel_layouts=stereo,alimiter=limit=0.707945:level=false:latency=true'
     duration=end-start
+    transcript={
+        'language':transcript.get('language'),
+        'segments':[segment for segment in transcript['segments']
+                    if segment['end']>start and segment['start']<end],
+    }
     import av
     with av.open(str(source)) as container:
         has_audio=bool(container.streams.audio)
+        vstream=next(iter(container.streams.video),None)
+        src_w=int(vstream.width) if vstream and vstream.width else 1280
+        src_h=int(vstream.height) if vstream and vstream.height else 720
     if stage:stage('captions_audio')
     if request.silence_removal and request.audio_mode!='voiceover':
         from .audio_edit import remove_pauses
-        source,transcript,start,end=remove_pauses(source,output.with_suffix('.trimmed.mp4'),transcript,start,end,has_audio,tick)
-        duration=end-start
+        from .audio_edit import speech_timeline
+        _, _, _, trimmed_duration = speech_timeline(transcript,start,end)
+        floor = min(duration,request.minimum) if request.mode=='shorts' and request.selection_version == 2 else 0
+        if trimmed_duration >= floor:
+            source,transcript,start,end=remove_pauses(source,output.with_suffix('.trimmed.mp4'),transcript,start,end,has_audio,tick)
+            duration=end-start
     narration=None
     caption_start,caption_end=start,end
     if request.audio_mode=='voiceover':
@@ -244,44 +303,136 @@ def _render(source,output,transcript,start,end,request,background=None,tick=lamb
             from jsonfile import write_json_atomic
             write_json_atomic(translated,transcript,ensure_ascii=True)
     generate_srt(transcript,caption_start,caption_end,str(srt))
-    generate_ass(transcript,caption_start,caption_end,str(ass),fontsize=18,font_name='Noto Sans',max_chars=30,effect='pop' if request.caption_style=='pop' else 'none',highlight_color='#FFFFFF' if request.caption_style=='clean' else '#FFD700')
+
+    # Build deterministic EditManifest driving layout, safe-area hook, captions, and scene-aware cropping
+    cand_meta = candidate_meta or {}
+    shot_cuts = [float(c) - start for c in cand_meta.get('internal_cuts', []) if start < float(c) < end]
+    has_explicit_bg = bool(
+        background and background.is_file() and (
+            request.preset == 'gameplay'
+            or (request.preset == 'auto' and (request.selection_version != 2 or request.background))
+        )
+    )
+    trajectory = None
+    tracking = {}
+    if request.mode == 'shorts' and request.preset in ('auto', 'smart') and not has_explicit_bg:
+        from .framing import trajectory as track, dedupe_sendcmd_lines
+        try:
+            trajectory, tracking = track(source, duration, shot_cuts=shot_cuts) if shot_cuts else track(source, duration)
+        except TypeError:
+            trajectory, tracking = track(source, duration)
+
+    manifest = build_edit_manifest(
+        source_start=start,
+        source_end=end,
+        request=request,
+        source_width=src_w,
+        source_height=src_h,
+        facecam_corners=cand_meta.get('face_corners', []),
+        has_center_face=bool(trajectory),
+        two_speakers_detected=bool(tracking.get('two_speakers')),
+        internal_cuts=cand_meta.get('internal_cuts', []),
+        climax_time=cand_meta.get('climax_time'),
+        design_preset=design_preset,
+        has_explicit_background=has_explicit_bg,
+    )
+    output.with_suffix('.manifest.json').write_text(json.dumps(manifest.model_dump(), indent=2), encoding='utf-8')
+
+    from .composition import GeometryRequest,geometry
+    split = manifest.layout == 'gameplay_split'
+    scene = geometry(GeometryRequest(ratio=request.split_ratio, secondary_position=request.background_position,
+                                     split=bool(split), hook_position=request.hook_position, caption_margin=request.caption_margin))
+    caption_margin = manifest.caption_margin if request.caption_margin is None else request.caption_margin
+    generate_ass(transcript,caption_start,caption_end,str(ass),fontsize=18,font_name='Noto Sans',max_chars=30,effect='pop' if request.caption_style=='pop' else 'none',highlight_color='#FFFFFF' if request.caption_style=='clean' else '#FFD700',
+                 **({'margin_v':round(caption_margin*288)} if caption_margin is not None else {}))
     # Source is already a precisely extracted selected interval.
     args=[ffmpeg(),'-hide_banner','-loglevel','error','-y','-threads','2','-i',str(source)]
-    width,height=(1080,1920) if request.mode=='shorts' else (request.output_height*16//9//2*2,request.output_height)
-    preset=request.preset
-    framing={'strategy':preset}
-    if preset=='auto':preset='gameplay' if background and background.is_file() else 'smart'
-    trajectory=None
-    if request.mode=='shorts' and preset=='smart':
-        from .framing import trajectory as track,dedupe_sendcmd_lines
-        trajectory,framing=track(source,duration)
-        if trajectory:
-            crop_w,crop_h,positions=trajectory
-            commands=output.with_suffix('.camera.txt')
-            commands.write_text('\n'.join(dedupe_sendcmd_lines(positions,2)),encoding='utf-8')
-        else:preset='blur'
-    if request.mode=='longs':
+    width,height=(manifest.output_width, manifest.output_height)
+    framing = {
+        'strategy': manifest.layout,
+        'reason': manifest.layout_reason,
+        'manifest_schema_version': manifest.schema_version,
+        **tracking,
+    }
+    if manifest.layout == 'fullscreen_smart_crop' and trajectory:
+        from .framing import dedupe_sendcmd_lines
+        crop_w, crop_h, positions = trajectory
+        commands = output.with_suffix('.camera.txt')
+        commands.write_text('\n'.join(dedupe_sendcmd_lines(positions, 2)), encoding='utf-8')
+
+    if request.mode=='longs' or manifest.layout == 'landscape_standard':
         graph=f'[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v]'
-    elif preset=='gameplay':
+    elif manifest.layout == 'gameplay_split':
         if not background or not background.is_file():
             raise ValueError('Gameplay requires an authorized background asset; choose Blur or upload an asset')
-        args+=['-stream_loop','-1','-threads','2','-i',str(background)]
-        top=2*round(1920*request.split_ratio/2)
-        bottom=1920-top
-        graph=f'[0:v]scale=1080:{top}:force_original_aspect_ratio=increase,crop=1080:{top},setsar=1[top];[1:v]scale=1080:{bottom}:force_original_aspect_ratio=increase,crop=1080:{bottom},setsar=1[bottom];[top][bottom]vstack[v]'
-    elif preset=='smart' and trajectory:
+        with av.open(str(background)) as secondary:
+            secondary_duration=(secondary.duration or 0)/av.time_base
+        if request.background_offset >= secondary_duration:
+            raise ValueError('Secondary start offset must be inside the selected video')
+        if request.background_loop:args+=['-stream_loop','-1']
+        args+=['-ss',str(request.background_offset),'-threads','2','-i',str(background)]
+        main_height=scene['primary']['height']
+        secondary_height=scene['secondary']['height']
+        def panel(source_tag, name, pheight):
+            fill=f'scale=1080:{pheight}:force_original_aspect_ratio=increase,crop=1080:{pheight},setsar=1'
+            fit=f'scale=1080:{pheight}:force_original_aspect_ratio=decrease,setsar=1'
+            if request.split_crop=='fill':
+                return f'{source_tag}{fill}[{name}]'
+            if request.split_crop=='fit':
+                return f'{source_tag}{fit},pad=1080:{pheight}:(ow-iw)/2:(oh-ih)/2[{name}]'
+            return (f'{source_tag}split[{name}base][{name}fg];'
+                    f'[{name}base]{fill},boxblur=24:2[{name}bg];'
+                    f'[{name}fg]{fit}[{name}fit];'
+                    f'[{name}bg][{name}fit]overlay=(W-w)/2:(H-h)/2[{name}]')
+        order='[main][secondary]' if request.background_position=='bottom' else '[secondary][main]'
+        framing.update(geometry=scene,secondary_position=request.background_position,primary_ratio=request.split_ratio,crop=request.split_crop)
+        graph=(panel('[0:v]','main',main_height)+';'+
+               f'[1:v]setpts=PTS/{request.background_speed},tpad=stop_mode=clone:stop_duration={duration}[secondary_input];'+
+               panel('[secondary_input]','secondary',secondary_height)+';'+f'{order}vstack=shortest=1[v]')
+    elif manifest.layout == 'gameplay_facecam' and manifest.facecam_corner and manifest.secondary_panel:
+        cam_h = manifest.secondary_panel.height
+        game_h = manifest.primary_panel.height
+        cam_filter = facecam_crop_filter(manifest.facecam_corner, 1080, cam_h)
+        framing.update(facecam_corner=manifest.facecam_corner, cam_height=cam_h, game_height=game_h)
+        graph = (
+            f'[0:v]split=3[cam_in][g_bg_in][g_fg_in];'
+            f'[cam_in]{cam_filter}[cam_panel];'
+            f'[g_bg_in]scale=1080:{game_h}:force_original_aspect_ratio=increase,crop=1080:{game_h},boxblur=24:2,eq=brightness=-0.08,setsar=1[g_bg];'
+            f'[g_fg_in]scale=1080:{game_h}:force_original_aspect_ratio=decrease,setsar=1[g_fg];'
+            f'[g_bg][g_fg]overlay=(W-w)/2:(H-h)/2[game_panel];'
+            f'[cam_panel][game_panel]vstack=inputs=2,setsar=1[v]'
+        )
+    elif manifest.layout == 'two_speaker_split' and tracking.get('speaker_centres'):
+        left_c, right_c = tracking['speaker_centres']
+        half_h = 960
+        crop_h = max(2, int(round(src_h * 0.85)) // 2 * 2)
+        crop_w = min(src_w, max(2, int(round(crop_h * (1080.0 / half_h))) // 2 * 2))
+        lx = max(0, min(src_w - crop_w, int(round(left_c[0] - crop_w / 2.0)))) // 2 * 2
+        ly = max(0, min(src_h - crop_h, int(round(left_c[1] - crop_h * 0.42)))) // 2 * 2
+        rx = max(0, min(src_w - crop_w, int(round(right_c[0] - crop_w / 2.0)))) // 2 * 2
+        ry = max(0, min(src_h - crop_h, int(round(right_c[1] - crop_h * 0.42)))) // 2 * 2
+        graph = (
+            f'[0:v]split=2[ta][ba];'
+            f'[ta]crop={crop_w}:{crop_h}:{lx}:{ly},scale=1080:{half_h},setsar=1[top];'
+            f'[ba]crop={crop_w}:{crop_h}:{rx}:{ry},scale=1080:{half_h},setsar=1[bot];'
+            f'[top][bot]vstack=inputs=2,setsar=1[v]'
+        )
+    elif manifest.layout == 'fullscreen_smart_crop' and trajectory:
         graph=f"[0:v]sendcmd=f='{escape_filter_value(str(commands.resolve()))}',crop@c={crop_w}:{crop_h}:{positions[0]}:0,scale=1080:1920,setsar=1[v]"
-    elif preset=='crop':
+    elif manifest.layout == 'fullscreen_smart_crop' and src_w / float(max(1, src_h)) <= 0.62:
+        graph='[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[v]'
+    elif manifest.layout == 'center_crop':
         # Explicit center framing fallback; no unverified face-tracking claim.
         graph='[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[v]'
     else:
-        graph='[0:v]split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:2[bg];[b]scale=1080:1920:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[v]'
+        # Source-fit over darkened blurred extension (preserves full gameplay HUD & action width cleanly)
+        graph='[0:v]split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:2,eq=brightness=-0.08[bg];[b]scale=1080:1920:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[v]'
     if request.captions and ass.exists():
         graph+=f";[v]ass=filename='{escape_filter_value(str(ass.resolve()))}'[captioned]"
         video='[captioned]'
     else:
         video='[v]'
-    if request.hook:
+    if request.hook and request.hook_mode!='none':
         hookfile=output.with_suffix('.hook.txt')
         fontsize=request.hook_font_size
         while True:
@@ -296,10 +447,18 @@ def _render(source,output,transcript,start,end,request,background=None,tick=lamb
             fontpath=Path(os.environ.get('WINDIR','C:/Windows'))/'Fonts'/{'sans':'arial.ttf','serif':'times.ttf','mono':'consola.ttf'}[request.hook_font]
             if fontpath.is_file():font=f"fontfile='{escape_filter_value(str(fontpath.resolve()))}':"
         hook_y={'top':'h*0.12','center':'(h-th)/2','bottom':'h*0.75-th'}[request.hook_position]
-        graph+=f";{video}drawtext={font}textfile='{escape_filter_value(str(hookfile.resolve()))}':expansion=none:fontcolor={request.hook_color}:fontsize={fontsize}:borderw={request.hook_outline}:bordercolor=black:shadowx={2 if request.hook_shadow else 0}:shadowy={2 if request.hook_shadow else 0}:box={int(request.hook_box)}:boxcolor=black@0.65:boxborderw=14:x=(w-tw)/2:y={hook_y}:enable='lt(t,{request.hook_duration})'[hooked]"
+        hook_mode=request.hook_mode or ('persistent' if request.text_mode in ('static_hook','hook_subtitles') else 'intro')
+        timing={'persistent':'1','intro':f'lt(t,{request.hook_duration})',
+                'timed':f'gte(t,{request.hook_start})*lt(t,{request.hook_end})'}[hook_mode]
+        if request.mode=='shorts':
+            anchor=scene['hook_anchor_y'] if manifest.layout=='gameplay_split' else manifest.hook_anchor_y
+            correction={'top':'','center':'-th/2','bottom':'-th'}[request.hook_position]
+            hook_y=f'{anchor}{correction}'
+        framing.update(hook_mode=hook_mode,hook_enable=timing,hook_anchor_y=manifest.hook_anchor_y)
+        graph+=f";{video}drawtext={font}textfile='{escape_filter_value(str(hookfile.resolve()))}':expansion=none:fontcolor={request.hook_color}:fontsize={fontsize}:borderw={request.hook_outline}:bordercolor=black:shadowx={2 if request.hook_shadow else 0}:shadowy={2 if request.hook_shadow else 0}:box={int(request.hook_box)}:boxcolor=black@0.65:boxborderw=14:x=(w-tw)/2:y={hook_y}:enable='{timing}'[hooked]"
         video='[hooked]'
     audio_map=None
-    next_input=2 if preset=='gameplay' and request.mode=='shorts' else 1
+    next_input=2 if manifest.layout=='gameplay_split' and request.mode=='shorts' else 1
     if request.logo_asset:
         logo=logo_path or config.DATA/'logos'/request.logo_asset
         if not logo.is_file():raise ValueError('Selected logo is unavailable')
@@ -329,6 +488,14 @@ def _render(source,output,transcript,start,end,request,background=None,tick=lamb
         audio_map='[audio]'
     elif has_audio and request.audio_mode!='silent':
         graph+=f';[0:a]{audio_filter}[audio]';audio_map='[audio]'
+    if request.transition=='fade':
+        fade_duration=min(.25,duration/4)
+        fade_end=duration-fade_duration
+        graph+=f';{video}fade=t=in:d={fade_duration},fade=t=out:st={fade_end}:d={fade_duration}[faded]'
+        video='[faded]'
+        if audio_map:
+            graph+=f';{audio_map}afade=t=in:d={fade_duration},afade=t=out:st={fade_end}:d={fade_duration}[faded_audio]'
+            audio_map='[faded_audio]'
     args+=['-filter_complex_threads','1','-filter_complex',graph,'-map',video]
     args+=['-map',audio_map,'-c:a','aac','-b:a','192k','-ar','48000'] if audio_map else ['-an']
     args+=[*video_encode_args(),'-maxrate',str(request.bitrate),'-bufsize',str(request.bitrate*2),'-threads','2','-pix_fmt','yuv420p']
@@ -343,7 +510,8 @@ def _render(source,output,transcript,start,end,request,background=None,tick=lamb
         report=validate_output(temporary,duration,request=request,expected_audio=audio_map is not None)
         temporary.replace(output)
     finally:temporary.unlink(missing_ok=True)
-    output.with_suffix('.validation.json').write_text(json.dumps({**report,'framing':framing}),encoding='utf-8')
+    from jsonfile import write_json_atomic
+    write_json_atomic(output.with_suffix('.validation.json'), {**report,'framing':framing})
     return output
 
 
@@ -357,6 +525,8 @@ def validate_output(path,duration,request=None,expected_audio=None):
         if request:
             expected=(1080,1920) if request.mode=='shorts' else (request.output_height*16//9//2*2,request.output_height)
             if (stream.width,stream.height)!=expected:raise RuntimeError('Rendered resolution/aspect ratio does not match the requested output')
+            if request.destination=='youtube_shorts' and container.duration/av.time_base>config.SHORTS_MAX_SECONDS:
+                raise RuntimeError(f'Rendered output exceeds the {config.SHORTS_MAX_SECONDS}s YouTube Shorts limit')
         if expected_audio is not None and bool(container.streams.audio)!=expected_audio:
             raise RuntimeError('Rendered audio track does not match the selected audio mode')
         frames=0;black_samples=0;sampled_frames=0;video_end=None
@@ -399,4 +569,34 @@ def concatenate(paths,output,tick=lambda *_:None):
     # Only application-generated file paths, never source-supplied strings.
     manifest=output.with_suffix('.concat.txt')
     manifest.write_text(''.join("file '"+p.name+"'\n" for p in paths),encoding='utf-8')
-    run([ffmpeg(),'-y','-hide_banner','-loglevel','error','-f','concat','-safe','1','-i',str(manifest),'-c','copy','-movflags','+faststart',str(output)],tick)
+    temporary=output.with_suffix('.assembling.mp4')
+    try:
+        run([ffmpeg(),'-y','-hide_banner','-loglevel','error','-f','concat','-safe','1','-i',manifest.name,
+             '-c','copy','-movflags','+faststart',temporary.name],tick,cwd=output.parent)
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def normalize_compilation(source,output,duration,height,tick):
+    """Make stream-copy assembly safe across source dimensions, frame rates and audio layouts."""
+    import av
+
+    width=height*16//9//2*2
+    with av.open(str(source)) as container:
+        has_audio=bool(container.streams.audio)
+    args=[ffmpeg(),'-y','-hide_banner','-loglevel','error','-threads','2','-i',str(source)]
+    if not has_audio:
+        args+=['-f','lavfi','-i','anullsrc=r=48000:cl=stereo']
+    args+=['-map','0:v:0','-map','0:a:0' if has_audio else '1:a:0',
+           '-vf',f'scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1',
+           '-af','apad','-t',str(duration),'-r','30','-c:v','libx264','-preset','fast',
+           '-threads','2','-filter_threads','1','-pix_fmt','yuv420p','-c:a','aac',
+           '-ac','2','-ar','48000','-movflags','+faststart','-progress','pipe:1']
+    temporary=output.with_suffix('.normalizing.mp4')
+    try:
+        run([*args,str(temporary)],tick,duration)
+        validate_output(temporary,duration,expected_audio=True)
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)

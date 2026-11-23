@@ -1,0 +1,14 @@
+services:
+  controller:
+    environment:
+      FACTORY_MANAGED_YOUTUBE_DIR: /run/secrets/youtube-managed/upload
+      FACTORY_MANAGED_ANALYTICS_DIR: /run/secrets/youtube-managed/analytics
+      YOUTUBE_TOKEN_DIR: /run/secrets/youtube
+      YOUTUBE_ANALYTICS_TOKEN_DIR: /run/secrets/analytics
+      DRIVE_OAUTH_CLIENT_FILE: /run/legacy-drive/client.json
+      DRIVE_OAUTH_TOKEN_FILE: /run/legacy-drive/token.json
+    volumes:
+      - ${FACTORY89_MANAGED_OAUTH:?Set FACTORY89_MANAGED_OAUTH}:/run/secrets/youtube-managed:ro
+      - ${FACTORY89_LEGACY_YOUTUBE:?Set FACTORY89_LEGACY_YOUTUBE}:/run/secrets/youtube:ro
+      - ${FACTORY89_LEGACY_ANALYTICS:?Set FACTORY89_LEGACY_ANALYTICS}:/run/secrets/analytics:ro
+      - ${FACTORY89_LEGACY_DRIVE:?Set FACTORY89_LEGACY_DRIVE}:/run/legacy-drive:ro

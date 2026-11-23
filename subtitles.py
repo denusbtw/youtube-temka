@@ -211,7 +211,10 @@ def generate_srt(transcript, clip_start, clip_end, output_path, max_chars=20, ma
     Generates an SRT file from the transcript for a specific time range.
     Groups words into short lines suitable for vertical video.
     """
-    blocks = _collect_word_blocks(transcript, clip_start, clip_end, max_chars, max_duration)
+    blocks = [
+        block for block in _collect_word_blocks(transcript, clip_start, clip_end, max_chars, max_duration)
+        if int(block[-1]['end'] * 1000) > int(block[0]['start'] * 1000)
+    ]
     if not blocks:
         return False
 
@@ -524,10 +527,9 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
 
 def format_srt_block(index, start, end, text):
     def format_time(seconds):
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        millis = int((seconds - int(seconds)) * 1000)
+        whole_seconds, millis = divmod(int(seconds * 1000), 1000)
+        hours, remainder = divmod(whole_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
         return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
         
     return f"{index}\n{format_time(start)} --> {format_time(end)}\n{text}\n\n"

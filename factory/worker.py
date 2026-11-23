@@ -69,11 +69,13 @@ def main():
             from .resources import memory_ready
             if not memory_ready() or not HEAVY_LOCK.acquire(False):
                 time.sleep(3);continue
+            delay = 3
             try:
                 response=client.post('/api/workers/claim',json={'worker':worker,'resources':hardware()})
                 response.raise_for_status()
                 claim=response.json()
                 if claim:
+                    delay = 0
                     from .assets import sync
                     try:
                         assets=sync(client,claim.get('assets',[]),lambda:pipeline.store.update(claim['job']['id'],claim['lease']))
@@ -82,11 +84,10 @@ def main():
                     except (httpx.HTTPError,ValueError,OSError,RuntimeError):
                         try:pipeline.store.update(claim['job']['id'],claim['lease'],state='BLOCKED',error='Worker asset synchronization failed; check the approved library, connection and cache budget, then retry.')
                         except InterruptedError:pass
-                else:
-                    time.sleep(3)
             except (httpx.HTTPError,ValueError):
-                time.sleep(10)
+                delay = 10
             finally:HEAVY_LOCK.release()
+            if delay:time.sleep(delay)
 
 
 if __name__=='__main__':

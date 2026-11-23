@@ -31,7 +31,16 @@ class Hooks(BaseModel):
     candidates:list[Hook]=Field(min_length=5,max_length=10)
 
 
-def suggest(text,language='en',model=None,source_title=''):
+def suggest(text,language='en',model=None,source_title='',confirmed_subject='',observation=''):
+    if observation.strip():
+        observed=' '.join(observation.split())
+        subject=' '.join(confirmed_subject.split())
+        choices=[observed, f'{subject} | {observed}' if subject else observed]
+        return {'schema_version':2,'language':language,'method':'operator_observation','review_required':True,
+                'warnings':[],'candidates':[{'text':value[:120],'language':language,'style':'direct',
+                'factual_support':observed,'reason':'Operator-confirmed observation','relevance_score':90,
+                'clarity_score':90,'curiosity_score':40,'ranking_score':80}
+                for value in dict.fromkeys(choices)]}
     language=language or 'en';base=language.split('-')[0]
     model=model or config.MODEL
     pool=[];method='neutral_fallback'

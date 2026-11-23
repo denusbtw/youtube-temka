@@ -24,6 +24,14 @@ def connect():
             id TEXT PRIMARY KEY, alias TEXT NOT NULL, title TEXT NOT NULL,
             daily_limit INTEGER NOT NULL DEFAULT 3, public_allowed INTEGER NOT NULL DEFAULT 0,
             automatic INTEGER NOT NULL DEFAULT 0)''')
+        db.execute('''CREATE TABLE IF NOT EXISTS youtube_profiles (
+            channel_key TEXT PRIMARY KEY, channel_id TEXT UNIQUE,
+            enabled INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'NOT_CONNECTED',
+            verified_at REAL, error TEXT)''')
+        if db.execute('SELECT count(*) FROM youtube_profiles').fetchone()[0] < 2:
+            db.executemany('INSERT OR IGNORE INTO youtube_profiles(channel_key) VALUES(?)',
+                           [('leonida_mayhem',), ('thevicescope',)])
+            db.commit()
         db.execute('''CREATE TABLE IF NOT EXISTS publications (
             id TEXT PRIMARY KEY, job TEXT NOT NULL, output INTEGER NOT NULL, channel TEXT NOT NULL,
             state TEXT NOT NULL, metadata TEXT NOT NULL, session TEXT, video_id TEXT,
@@ -64,6 +72,25 @@ def connect():
             job TEXT NOT NULL, at REAL NOT NULL, state TEXT NOT NULL, detail TEXT)''')
         db.execute('''CREATE TABLE IF NOT EXISTS factory_settings (
             key TEXT PRIMARY KEY, value TEXT NOT NULL)''')
+        db.execute('''CREATE TABLE IF NOT EXISTS render_lineages (
+            id TEXT PRIMARY KEY, last_version INTEGER NOT NULL)''')
+        db.execute('CREATE TABLE IF NOT EXISTS job_visibility (job TEXT PRIMARY KEY, status TEXT NOT NULL)')
+        db.execute('''CREATE TABLE IF NOT EXISTS editorial_feedback (
+            id TEXT PRIMARY KEY, job TEXT NOT NULL, candidate_index INTEGER,
+            decision TEXT NOT NULL, rejection_reasons TEXT NOT NULL DEFAULT '[]',
+            original_start REAL, original_end REAL, corrected_start REAL, corrected_end REAL,
+            original_score REAL, selected_layout TEXT, edited_hook TEXT,
+            notes TEXT NOT NULL DEFAULT '', created REAL NOT NULL)''')
+        db.execute('''CREATE TABLE IF NOT EXISTS source_rights (
+            job TEXT PRIMARY KEY, source_url TEXT, original_creator TEXT,
+            permission_status TEXT NOT NULL DEFAULT 'operator_confirmed',
+            license TEXT NOT NULL DEFAULT '', attribution_required INTEGER NOT NULL DEFAULT 0,
+            commercial_restrictions TEXT NOT NULL DEFAULT '',
+            reused_content_acknowledged INTEGER NOT NULL DEFAULT 0, recorded_at REAL NOT NULL)''')
+        db.execute('''CREATE TABLE IF NOT EXISTS production_metrics (
+            job TEXT PRIMARY KEY, analysis_seconds REAL, render_seconds REAL,
+            candidate_count INTEGER, approved_count INTEGER, model_calls INTEGER,
+            vlm_calls INTEGER, peak_vram_mib INTEGER, updated REAL NOT NULL)''')
         yield db
 
 
@@ -74,21 +101,44 @@ def decode(row,db=None):
     for k in ('request', 'result'):
         item[k] = json.loads(item[k])
     item.pop('lease', None)
+    visibility=db.execute('SELECT status FROM job_visibility WHERE job=?',(item['id'],)).fetchone() if db else None
+    item['visibility']=visibility['status'] if visibility else 'recent'
     if db is not None:
         item['stages']=[dict(r) for r in db.execute('SELECT key,status,started,finished,current,total,unit,message FROM job_stages WHERE job=? ORDER BY started',(item['id'],))]
     return item
 
 
-def create(request):
+def create(request, seed=None, approved=None):
     jid = uuid.uuid4().hex
+    result = {'approved_selection':approved} if approved else {}
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
         if request.get('source','').startswith('edit:'):
-            origin=request['source'].split(':')[1]
+            _, origin, index_text = request['source'].split(':')
+            index = int(index_text)
             package=db.execute('SELECT state FROM retention_packages WHERE job=?',(origin,)).fetchone()
             if package and package['state'] in ('DELETION_PENDING','DELETED'):raise ValueError('Source package is being removed or has expired; restore it before editing')
-        db.execute('INSERT INTO jobs(id,state,request,created) VALUES(?,?,?,?)',
-                   (jid, 'QUEUED', json.dumps(request, ensure_ascii=False), time.time()))
+            parent = db.execute("SELECT result FROM jobs WHERE id=? AND state='READY'", (origin,)).fetchone()
+            outputs = json.loads(parent['result']).get('outputs', []) if parent else []
+            if not 0 <= index < len(outputs):
+                raise ValueError('Editable source output is unavailable')
+            parent_output = outputs[index]
+            parent_id = parent_output.get('render_id') or f'{origin}:{index+1}'
+            lineage = parent_output.get('render_lineage_id') or parent_id
+            version = db.execute('''INSERT INTO render_lineages(id,last_version) VALUES(?,?)
+                ON CONFLICT(id) DO UPDATE SET last_version=MAX(render_lineages.last_version+1,excluded.last_version)
+                RETURNING last_version''', (lineage, (parent_output.get('render_version') or 1)+1)).fetchone()[0]
+            result['edit_revision'] = {'render_lineage_id': lineage, 'parent_render_id': parent_id, 'render_version': version}
+        if seed:
+            from shutil import copyfile
+            result['local_checkpoint_seed']=True
+            root = config.SCRATCH / jid
+            root.mkdir()
+            copyfile(seed,root/'transcript.json')
+            visual=seed.parent/'visual-v2.json'
+            if visual.is_file():copyfile(visual,root/visual.name)
+        db.execute('INSERT INTO jobs(id,state,request,result,created) VALUES(?,?,?,?,?)',
+                   (jid, 'QUEUED', json.dumps(request, ensure_ascii=False), json.dumps(result), time.time()))
         db.execute('INSERT INTO events VALUES(?,?,?,?)',(jid,time.time(),'QUEUED','Job queued'))
     return get(jid)
 
@@ -103,24 +153,52 @@ def list_jobs(limit=200,offset=0):
         return [decode(r,db) for r in db.execute('SELECT * FROM jobs ORDER BY created DESC LIMIT ? OFFSET ?',(min(200,max(1,limit)),max(0,offset))).fetchall()]
 
 
+def can_claim_remote(payload):
+    request = json.loads(payload)
+    urls = [item['source'] for item in request.get('sources', [])] or [request['source']]
+    return request['save_drive'] and all(not url.startswith('upload:') for url in urls)
+
+
 def claim(worker, remote=False):
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
-        # Uncertain external effects must be reviewed, never replayed blindly.
-        expired=db.execute("UPDATE jobs SET state='BLOCKED',error='Worker lease expired; inspect outputs before retry',lease=NULL WHERE lease IS NOT NULL AND seen < ? RETURNING id", (time.time()-120,)).fetchall()
+        now = time.time()
+        expired = db.execute("SELECT id,state,result FROM jobs WHERE lease IS NOT NULL AND seen < ?", (now-120,))
         for item in expired:
-            db.execute('INSERT INTO events VALUES(?,?,?,?)',(item['id'],time.time(),'BLOCKED','Worker lease expired; inspect outputs before retry'))
-            db.execute("UPDATE job_stages SET status='failed',finished=?,message='Worker lease expired; checkpoints retained' WHERE job=? AND status='running'",(time.time(),item['id']))
+            result = json.loads(item['result'])
+            # Drive may have accepted a write before the worker lost its lease.
+            retryable = item['state'] != 'UPLOADING' or bool(result.get('cloud_verified'))
+            message = ('Worker lease expired; checkpoints retained' if retryable else
+                       'Worker lease expired during upload; inspect remote outputs before retry')
+            failure = {'code':'WORKER_LEASE_EXPIRED','stage':result.get('active_stage') or item['state'],
+                       'message':message,'retryable':retryable}
+            state = schedule_retry(result, failure, now) if retryable else 'BLOCKED'
+            result['failure'] = failure
+            db.execute('UPDATE jobs SET state=?,error=?,result=?,lease=NULL,seen=? WHERE id=?',
+                       (state,message,json.dumps(result,ensure_ascii=False),now,item['id']))
+            db.execute('INSERT INTO events VALUES(?,?,?,?)',(item['id'],now,state,message))
+            db.execute("UPDATE job_stages SET status='failed',finished=?,message=? WHERE job=? AND status='running'",(now,message,item['id']))
         if db.execute('SELECT 1 FROM jobs WHERE worker=? AND lease IS NOT NULL',(worker,)).fetchone():
             return None
-        rows = db.execute("SELECT id,request FROM jobs WHERE state='QUEUED' AND cancelled=0 ORDER BY created")
-        row = next((r for r in rows if not remote or (not json.loads(r['request'])['source'].startswith('upload:') and json.loads(r['request'])['save_drive'])),None)
+        rows = db.execute("""SELECT id,request,result FROM jobs WHERE state='QUEUED' AND cancelled=0
+                          AND coalesce(json_extract(result,'$.retry_at'),0)<=? ORDER BY created""", (now,))
+        row = next((r for r in rows if not remote or (can_claim_remote(r['request']) and not json.loads(r['request']).get('plan_only') and not json.loads(r['result']).get('local_checkpoint_seed'))),None)
         if not row:
             return None
         lease = uuid.uuid4().hex
-        db.execute("UPDATE jobs SET state='PROBING',worker=?,lease=?,seen=? WHERE id=?", (worker,lease,time.time(),row['id']))
+        db.execute("UPDATE jobs SET state='PROBING',error=NULL,worker=?,lease=?,seen=?,result=json_remove(result,'$.retry_at') WHERE id=?", (worker,lease,now,row['id']))
         db.execute('INSERT INTO events VALUES(?,?,?,?)',(row['id'],time.time(),'PROBING','Lease assigned to '+worker))
         return {'job': decode(db.execute('SELECT * FROM jobs WHERE id=?', (row['id'],)).fetchone()), 'lease': lease}
+
+
+def schedule_retry(result, failure, now):
+    used = result.get('automatic_retries', 0)
+    failure.update(attempt=used+1, max_attempts=config.AUTOMATIC_RETRIES+1)
+    if used >= config.AUTOMATIC_RETRIES:
+        return 'FAILED'
+    result['automatic_retries'] = used+1
+    result['retry_at'] = now + (30 if failure['code']=='DOWNLOAD_RATE_LIMITED' else 5) * 2**used
+    return 'QUEUED'
 
 
 def update(jid, lease, state=None, result=None, error=None, current=None, total=None,stage_update=None):
@@ -138,12 +216,19 @@ def update(jid, lease, state=None, result=None, error=None, current=None, total=
                     provenance=metadata.pop('_provenance',{})
                     db.execute('INSERT OR IGNORE INTO metadata_versions VALUES(?,?,?,?,?,?,?)',(jid,index,metadata['version'],json.dumps(metadata,ensure_ascii=False),json.dumps(provenance,ensure_ascii=False),time.time(),0))
             value.update(result)
+        if state=='QUEUED':
+            failure=value.get('failure')
+            if row['state']=='UPLOADING' or not failure or not failure.get('retryable'):
+                raise ValueError('Automatic retry requires a retryable processing failure')
+            state=schedule_retry(value,failure,time.time())
+        if state=='READY':
+            value.pop('failure',None)
         if state is None:
             if current is None:
                 current=row['current']
             if total is None:
                 total=row['total']
-        terminal = state in ('READY','FAILED','BLOCKED','CANCELLED')
+        terminal = state in ('READY','FAILED','BLOCKED','CANCELLED','QUEUED','REVIEW')
         db.execute('UPDATE jobs SET state=?,result=?,error=?,current=?,total=?,seen=?,lease=? WHERE id=?',
                    (state or row['state'], json.dumps(value, ensure_ascii=False), error,current,total,time.time(),None if terminal else lease,jid))
         db.execute('UPDATE workers SET seen=? WHERE id=?',(time.time(),row['worker']))
@@ -152,13 +237,13 @@ def update(jid, lease, state=None, result=None, error=None, current=None, total=
         if stage_update:
             s=stage_update
             status=s.get('status','running')
-            if status not in ('running','completed','skipped','failed','pending'):
+            if status not in ('running','completed','skipped','failed','blocked','pending'):
                 raise ValueError('Invalid stage status')
             db.execute('''INSERT INTO job_stages VALUES(?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(job,key) DO UPDATE SET status=excluded.status,
                 finished=excluded.finished,current=excluded.current,total=excluded.total,
                 unit=excluded.unit,message=excluded.message''',
-                (jid,s['key'],status,time.time(),time.time() if status in ('completed','skipped','failed') else None,s.get('current'),s.get('total'),s.get('unit'),s.get('message')))
+                (jid,s['key'],status,time.time(),time.time() if status in ('completed','skipped','failed','blocked') else None,s.get('current'),s.get('total'),s.get('unit'),s.get('message')))
 
 
 def heartbeat(worker, resources):
@@ -186,10 +271,54 @@ def cancel(jid):
 def retry(jid):
     with connect() as db:
         # A retry resumes files/checkpoints; verified Drive outputs are retained.
-        cur = db.execute("UPDATE jobs SET state='QUEUED',error=NULL,cancelled=0,lease=NULL WHERE id=? AND state IN ('FAILED','BLOCKED','CANCELLED')", (jid,))
+        cur = db.execute("""UPDATE jobs SET state='QUEUED',error=NULL,cancelled=0,lease=NULL,
+                         result=json_remove(result,'$.automatic_retries','$.retry_at','$.failure')
+                         WHERE id=? AND state IN ('FAILED','BLOCKED','CANCELLED')""", (jid,))
         if cur.rowcount:
             db.execute('INSERT INTO events VALUES(?,?,?,?)',(jid,time.time(),'QUEUED','Manual retry; checkpoints retained'))
         return cur.rowcount == 1
+
+
+def edit_plan(jid, revision, edits, target, approve=False):
+    from .models import JobRequest
+
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT state,request,result FROM jobs WHERE id=?',(jid,)).fetchone()
+        if row is None:
+            raise KeyError(jid)
+        result = json.loads(row['result'])
+        plan = result.get('edit_plan')
+        if row['state']!='REVIEW' or not plan or plan['revision']!=revision:
+            raise InterruptedError('The edit plan changed or was submitted. Reload and try again.')
+        request = JobRequest.model_validate_json(row['request'])
+        original = {segment['id']:segment for segment in plan['segments']}
+        if len({edit['id'] for edit in edits})!=len(edits):
+            raise ValueError('Choose each segment at most once')
+        selected = []
+        for edit in edits:
+            segment = original.get(edit['id'])
+            if segment is None:
+                raise ValueError('Unknown segment in edit plan')
+            start,end = edit['start_seconds'],edit['end_seconds']
+            source = plan['sources'][segment['source_id']]
+            if not request.minimum<=end-start<=request.maximum or end+segment['source_offset']>source['end']+1e-8:
+                raise ValueError(f'Segment {edit["id"]}: choose a range within the source and the clip duration limits')
+            selected.append({**segment,**edit})
+            if (start,end)!=(segment['start_seconds'],segment['end_seconds']):
+                selected[-1].update(selection_method='manual_boundaries',reason='Boundaries edited by the operator')
+                selected[-1].pop('score',None)
+        if target is not None and request.workflow!='compilation':
+            raise ValueError('A timeline target is available for compilations')
+        plan.update(revision=revision+1,segments=selected,approved=approve)
+        if target is not None:
+            plan['target_duration']=target
+        state = 'QUEUED' if approve else 'REVIEW'
+        db.execute('UPDATE jobs SET state=?,result=?,seen=? WHERE id=?',
+                   (state,json.dumps(result,ensure_ascii=False),time.time(),jid))
+        if approve:
+            db.execute('INSERT INTO events VALUES(?,?,?,?)',(jid,time.time(),state,'Edit plan approved for rendering'))
+        return plan
 
 
 def approve(jid,index,value):
@@ -244,4 +373,170 @@ def preferences(channel):
 def source_in_use(source,exclude):
     # Never use the paginated UI list to decide whether an original may go away.
     with connect() as db:
-        return db.execute("SELECT 1 FROM jobs WHERE id<>? AND json_extract(request,'$.source')=? AND state<>'READY' LIMIT 1",(exclude,source)).fetchone() is not None
+        return db.execute("""SELECT 1 FROM jobs WHERE id<>? AND state<>'READY' AND
+                            (json_extract(request,'$.source')=? OR EXISTS (
+                              SELECT 1 FROM json_each(jobs.request,'$.sources')
+                              WHERE json_extract(value,'$.source')=?)) LIMIT 1""",
+                          (exclude,source,source)).fetchone() is not None
+
+
+def record_feedback(job_id, payload):
+    fid = uuid.uuid4().hex
+    now = time.time()
+    with connect() as db:
+        db.execute(
+            '''INSERT INTO editorial_feedback(
+                id, job, candidate_index, decision, rejection_reasons,
+                original_start, original_end, corrected_start, corrected_end,
+                original_score, selected_layout, edited_hook, notes, created
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (
+                fid,
+                job_id,
+                payload.get('candidate_index'),
+                payload['decision'],
+                json.dumps(payload.get('rejection_reasons', []), ensure_ascii=False),
+                payload.get('original_start'),
+                payload.get('original_end'),
+                payload.get('corrected_start'),
+                payload.get('corrected_end'),
+                payload.get('original_score'),
+                payload.get('selected_layout'),
+                payload.get('edited_hook'),
+                payload.get('notes', '')[:500],
+                now,
+            ),
+        )
+    return {'id': fid, 'job': job_id, 'created': now, **payload}
+
+
+def list_feedback(job_id=None, limit=200):
+    with connect() as db:
+        if job_id:
+            rows = db.execute(
+                'SELECT * FROM editorial_feedback WHERE job=? ORDER BY created DESC LIMIT ?',
+                (job_id, min(500, max(1, limit))),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                'SELECT * FROM editorial_feedback ORDER BY created DESC LIMIT ?',
+                (min(500, max(1, limit)),),
+            ).fetchall()
+        out = []
+        for r in rows:
+            item = dict(r)
+            item['rejection_reasons'] = json.loads(item['rejection_reasons'] or '[]')
+            out.append(item)
+        return out
+
+
+def feedback_summary():
+    from collections import Counter
+    items = list_feedback(limit=500)
+    decisions = Counter(i['decision'] for i in items)
+    reasons = Counter(r for i in items for r in i.get('rejection_reasons', []))
+    total = len(items)
+    approved = decisions.get('approved', 0)
+    return {
+        'total_decisions': total,
+        'approved_count': approved,
+        'approval_rate': round(approved / total, 4) if total else None,
+        'decisions': dict(decisions),
+        'rejection_reasons': dict(reasons),
+        'automatic_training_enabled': False,
+        'note': 'Feedback is persisted for editorial audit and offline calibration; weights are not silently mutated online.',
+    }
+
+
+def save_source_rights(job_id, rights):
+    with connect() as db:
+        db.execute(
+            '''INSERT OR REPLACE INTO source_rights(
+                job, source_url, original_creator, permission_status, license,
+                attribution_required, commercial_restrictions, reused_content_acknowledged, recorded_at
+            ) VALUES (?,?,?,?,?,?,?,?,?)''',
+            (
+                job_id,
+                rights.get('source_url'),
+                rights.get('original_creator', ''),
+                rights.get('permission_status', 'operator_confirmed'),
+                rights.get('license', ''),
+                int(bool(rights.get('attribution_required', False))),
+                rights.get('commercial_restrictions', ''),
+                int(bool(rights.get('reused_content_acknowledged', False))),
+                time.time(),
+            ),
+        )
+
+
+def get_source_rights(job_id):
+    with connect() as db:
+        row = db.execute('SELECT * FROM source_rights WHERE job=?', (job_id,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item['attribution_required'] = bool(item['attribution_required'])
+        item['reused_content_acknowledged'] = bool(item['reused_content_acknowledged'])
+        return item
+
+
+def record_production_metrics(job_id, metrics):
+    with connect() as db:
+        db.execute(
+            '''INSERT OR REPLACE INTO production_metrics(
+                job, analysis_seconds, render_seconds, candidate_count,
+                approved_count, model_calls, vlm_calls, peak_vram_mib, updated
+            ) VALUES (?,?,?,?,?,?,?,?,?)''',
+            (
+                job_id,
+                metrics.get('analysis_seconds'),
+                metrics.get('render_seconds'),
+                metrics.get('candidate_count'),
+                metrics.get('approved_count'),
+                metrics.get('model_calls'),
+                metrics.get('vlm_calls'),
+                metrics.get('peak_vram_mib'),
+                time.time(),
+            ),
+        )
+
+
+def production_summary():
+    with connect() as db:
+        rows = [dict(r) for r in db.execute('SELECT * FROM production_metrics ORDER BY updated DESC LIMIT 200').fetchall()]
+    fb = feedback_summary()
+    if not rows:
+        return {'tracked_jobs': 0, 'feedback': fb, 'note': 'No tracked production jobs yet.'}
+    n = len(rows)
+    return {
+        'tracked_jobs': n,
+        'avg_analysis_seconds': round(sum(r['analysis_seconds'] or 0 for r in rows) / n, 2),
+        'avg_render_seconds': round(sum(r['render_seconds'] or 0 for r in rows) / n, 2),
+        'total_candidates': sum(r['candidate_count'] or 0 for r in rows),
+        'total_model_calls': sum(r['model_calls'] or 0 for r in rows),
+        'total_vlm_calls': sum(r['vlm_calls'] or 0 for r in rows),
+        'max_peak_vram_mib': max((r['peak_vram_mib'] or 0 for r in rows), default=0),
+        'feedback': fb,
+    }
+
+
+def editorial_workflow_state(job):
+    """Explicit editorial workflow state distinct from technical job READY."""
+    state = job.get('state', '')
+    if state in ('QUEUED', 'PROBING', 'DOWNLOADING', 'TRANSCRIBING', 'ANALYZING'):
+        return 'ANALYSIS_IN_PROGRESS'
+    if state in ('RENDERING', 'UPLOADING'):
+        return 'RENDERING_IN_PROGRESS'
+    if state in ('FAILED', 'BLOCKED', 'CANCELLED'):
+        return 'RENDER_VALIDATION_FAILED' if state == 'FAILED' else state
+    result = job.get('result') or {}
+    if result.get('planning_only'):
+        return 'CANDIDATES_READY'
+    outputs = result.get('outputs') or []
+    if not outputs:
+        return 'CANDIDATES_READY' if result.get('candidates') else 'NEEDS_EDITORIAL_REVIEW'
+    if any(o.get('editorial', {}).get('technical_valid') is False for o in outputs):
+        return 'RENDER_VALIDATION_FAILED'
+    if all(o.get('approved') for o in outputs):
+        return 'READY_FOR_PUBLISHING_REVIEW' if result.get('cloud_verified') else 'APPROVED'
+    return 'NEEDS_EDITORIAL_REVIEW'

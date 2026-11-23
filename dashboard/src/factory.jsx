@@ -15,10 +15,13 @@ import CreatePage from "./factory/CreatePage.jsx";
 import StageProgress from "./factory/StageProgress.jsx";
 import VoiceSettings from "./factory/VoiceSettings.jsx";
 import OutputEditor from "./factory/OutputEditor.jsx";
+import EditPlan from "./factory/EditPlan.jsx";
 import PublisherPanel from "./factory/PublisherPanel.jsx";
 import MetadataEditor from "./factory/MetadataEditor.jsx";
 import AnalyticsPanel from "./factory/AnalyticsPanel.jsx";
 import StoragePanel from "./factory/StoragePanel.jsx";
+import SelectionReview from "./factory/SelectionReview.jsx";
+import JobHistory from "./factory/JobHistory.jsx";
 import AssetLibrary from "./factory/AssetLibrary.jsx";
 
 async function api(path, options = {}) {
@@ -47,7 +50,7 @@ async function api(path, options = {}) {
 }
 const post = (path, body = {}) =>
   api(path, { method: "POST", body: JSON.stringify(body) });
-const pages = [["Create", Plus], ["Jobs", ListVideo], ["Editor", Scissors], ["Publish", Upload], ["Settings", Settings]];
+const pages = [["Create", Plus], ["Jobs", ListVideo], ["Editor", Scissors], ["Library", FolderOpen], ["Publish", Upload], ["Settings", Settings]];
 
 function ModelConfiguration({ settings, act }) {
   const [ollama, setOllama] = useState(settings?.ollama_model || "qwen2.5:3b");
@@ -134,6 +137,7 @@ function App() {
   const [selected, setSelected] = useState(null),
     [edits, setEdits] = useState({});
   const [outputIndex,setOutputIndex]=useState(0);
+  const [publishSelection, setPublishSelection] = useState("");
   const [libraryQuery, setLibraryQuery] = useState("");
   const [libraryMode, setLibraryMode] = useState("all");
   const act = async (fn) => {
@@ -206,7 +210,7 @@ function App() {
           </>
         ) : (
           <small>
-            {["READY", "FAILED", "BLOCKED", "CANCELLED", "QUEUED"].includes(
+            {["READY", "FAILED", "BLOCKED", "CANCELLED", "QUEUED", "REVIEW"].includes(
               j.state,
             )
               ? ""
@@ -390,10 +394,7 @@ function App() {
           />
         )}
         {page === "Jobs" && (
-          <>
-            {jobs.map(jobRow)}
-            {jobs.length === 0 && <p className="muted">Черга порожня.</p>}
-          </>
+          <JobHistory jobs={jobs} render={jobRow} api={api} post={post} act={act} refresh={refresh}/>
         )}
         {page === "Editor" && (
           <>
@@ -419,11 +420,18 @@ function App() {
                     : chosen.result.analysis}
                 </p>
                 {chosen.result.selection_summary && <p className="muted">{chosen.result.selection_summary}</p>}
+                {chosen.result.signal_coverage && <small>
+                  Візуальний і звуковий аналіз охопив {chosen.result.signal_coverage.scanned_seconds} з {chosen.result.signal_coverage.source_seconds} сек.
+                </small>}
                 {(chosen.result.candidates || []).some((c) => c.editorial_review_required || c.selection_method === "heuristic" || c.score < 50 || c.confidence < .6) && (
                   <p className="warning">Відбір або назва потребує редакторської перевірки. Перевірте уривок і назву перед схваленням; автоматична публікація таких уривків очікує схвалення.</p>
                 )}
+                {chosen.request.mode==='shorts' && <SelectionReview key={chosen.id+':' +(chosen.result.selection_id||'legacy')} job={chosen} post={post} act={act} onCreated={async j=>{setSelected(j.id);setOutputIndex(0);await refresh();}}/>}
                 {chosen.error && <p className="error">{chosen.error}</p>}
-                <label>Уривок<select value={outputIndex} onChange={e=>setOutputIndex(+e.target.value)}>{(chosen.result.outputs||[]).map((o,i)=><option key={o.name} value={i}>{i+1}. {o.title}</option>)}</select></label>
+                {chosen.state==='REVIEW' && chosen.result.edit_plan && <EditPlan
+                  key={chosen.id+':'+chosen.result.edit_plan.revision}
+                  job={chosen} api={api} post={post} act={act} onSaved={refresh}/>}
+                {!!chosen.result.outputs?.length && <label>Уривок<select value={outputIndex} onChange={e=>setOutputIndex(+e.target.value)}>{(chosen.result.outputs||[]).map((o,i)=><option key={o.name} value={i}>{i+1}. {o.title}</option>)}</select></label>}
                 <div className="outputs">
                   {(chosen.result.outputs || []).map((o, i) => i===Math.min(outputIndex,(chosen.result.outputs||[]).length-1) && (
                     <section key={`${chosen.id}:${o.name}`}>
@@ -447,6 +455,7 @@ function App() {
                         </a>
                       )}
                       <h3>{o.title}</h3>
+                      {o.render_version && <small>Версія відео {o.render_version}</small>}
                       <MetadataEditor job={chosen} output={o} index={i} api={api} post={post} act={act} onSaved={refresh}/>
                       <OutputEditor
                         job={chosen}
@@ -481,12 +490,21 @@ function App() {
                         >
                           {o.approved ? "Скасувати схвалення" : "Схвалити"}
                         </button>
+                        <button
+                          disabled={!o.approved || !o.drive || !chosen.result.cloud_verified}
+                          onClick={() => {
+                            setPublishSelection(`${chosen.id}:${i}`);
+                            setPage("Publish");
+                          }}
+                        >
+                          До публікації
+                        </button>
                       </div>
                     </section>
                   ))}
                 </div>
-                <h2>Кандидати та повторний монтаж</h2>
-                {(chosen.result.candidates || []).map((c, i) => (
+                {chosen.state!=='REVIEW' && !['compilation','story'].includes(chosen.request.workflow) && !chosen.result.selection_id && <h2>Кандидати та повторний монтаж</h2>}
+                {chosen.state!=='REVIEW' && !['compilation','story'].includes(chosen.request.workflow) && !chosen.result.selection_id && (chosen.result.candidates || []).map((c, i) => (
                   <section className="candidate" key={i}>
                     <b>{c.title}</b>
                     <small>
@@ -547,6 +565,7 @@ function App() {
                           ];
                           const j = await post("/jobs", {
                             ...chosen.request,
+                            review_before_render: false,
                             intervals: [
                               [
                                 range[0] + chosen.request.start,
@@ -664,8 +683,9 @@ function App() {
           </>
         )}
         {page === "Publish" && (
-          <PublisherPanel outputs={outputs} settings={settings} act={act} api={api} post={post} refreshJobs={refresh} />
+          <PublisherPanel outputs={outputs} initialSelection={publishSelection} settings={settings} act={act} api={api} post={post} refreshJobs={refresh} />
         )}
+        {page === "Library" && <AssetLibrary api={api} post={post} act={act}/>}
         {page === "Settings" && (
           <>
             <section>
@@ -746,7 +766,7 @@ function App() {
                 />
               )}
             </section>
-            <AssetLibrary api={api} post={post} act={act}/>
+
             <StoragePanel api={api} post={post} act={act}/>
             <VoiceSettings settings={settings} post={post} act={act} />
             <section>

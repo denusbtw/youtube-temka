@@ -23,8 +23,8 @@ export default function AnalyticsPanel({ api, post, act }) {
     data.channels[0];
   const videos = current?.videos || [];
   const daily = current?.report?.daily || [];
-  const totalViews = sum(daily, "views");
-  const watch = sum(daily, "estimatedMinutesWatched");
+  const totalViews = current?.report?.totals?.views ?? sum(daily, "views");
+  const watch = current?.report?.totals?.estimatedMinutesWatched ?? sum(daily, "estimatedMinutesWatched");
   const weighted = videos.filter(
     (v) => (v.metrics.views || 0) > 0 && v.metrics.averageViewDuration != null,
   );
@@ -78,6 +78,14 @@ export default function AnalyticsPanel({ api, post, act }) {
       </details>
       {current && (
         <>
+          {current.report?.experiments?.map(experiment=><details key={experiment.parent}>
+            <summary>Варіанти монтажу · {experiment.start} – {experiment.end}</summary>
+            <p>Дані за спільний період після публікації обох варіантів.</p>
+            <table><thead><tr><th>Варіант</th><th>Перегляди</th><th>Залучені перегляди</th><th>Сер. час, с</th><th>Сер. %</th><th>Вподобання</th><th>Коментарі</th></tr></thead>
+            <tbody>{experiment.variants.map(item=><tr key={item.video_id}><td>{item.variant} · {item.title}</td>
+              {['views','engagedViews','averageViewDuration','averageViewPercentage','likes','comments'].map(metric=><td key={metric}>{number(item.metrics[metric])}</td>)}
+            </tr>)}</tbody></table>
+          </details>)}
           <label>
             Канал аналітики
             <select
@@ -128,6 +136,9 @@ export default function AnalyticsPanel({ api, post, act }) {
                 затримкою. Вік кешу: {Math.floor(current.data_age_seconds / 60)}{" "}
                 хв.
               </p>
+              {current.report.credential_strategy === "verified_publishing_readonly" && (
+                <p>Немонетарний звіт · чинний дозвіл YouTube на читання.</p>
+              )}
               <div className="stats">
                 <div>
                   <small>Перегляди каналу за період</small>

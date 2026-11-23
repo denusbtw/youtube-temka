@@ -12,6 +12,7 @@ def record(pid,state,error=None):
 
 def apply(publication):
     from .publisher import token_file,YT
+    from .youtube_channels import require_ready
     metadata=json.loads(publication['metadata'])
     remote=(metadata.get('thumbnail') or {}).get('drive')
     if not remote or not publication.get('video_id'):return
@@ -20,6 +21,8 @@ def apply(publication):
         record(publication['id'],'ASSET_ONLY','Thumbnail exceeds the bounded 4 MiB transfer limit');return
     youtube=drive=None
     try:
+        with store.connect() as db:
+            require_ready(publication['channel'],db)
         youtube=Drive(token_file(publication['alias']))
         video=youtube.request('GET',YT+'/videos',params={'part':'snippet,processingDetails','id':publication['video_id']}).json().get('items',[])
         if not video or video[0]['snippet']['channelId']!=publication['channel']:raise ValueError('Thumbnail channel verification failed')

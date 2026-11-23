@@ -99,14 +99,202 @@ def test_worker_survives_first_job_and_processes_second(tmp_path,monkeypatch):
     assert len(done)==2 and {j['state'] for j in store.list_jobs()}=={'FAILED','READY'}
 
 
-def test_expired_processing_lease_preserves_checkpoints_for_manual_recovery(tmp_path,monkeypatch):
+def test_expired_processing_lease_requeues_and_fences_after_backoff(tmp_path,monkeypatch):
     monkeypatch.setattr(config,'DATA',tmp_path);monkeypatch.setattr(config,'SCRATCH',tmp_path/'scratch');monkeypatch.setattr(config,'DB',tmp_path/'db')
     job=store.create(req().model_dump());claim=store.claim('dead-worker')
     store.update(job['id'],claim['lease'],state='TRANSCRIBING',stage_update={'key':'transcription','status':'running','current':900,'total':1800,'unit':'seconds'})
     with store.connect() as db:db.execute('UPDATE jobs SET seen=0 WHERE id=?',(job['id'],))
     assert store.claim('replacement') is None
-    assert store.get(job['id'])['stages'][0]['current']==900
-    assert store.retry(job['id'])
+    recovering = store.get(job['id'])
+    assert recovering['stages'][0]['current']==900
+    assert recovering['state']=='QUEUED'
+    assert recovering['result']['failure']['code']=='WORKER_LEASE_EXPIRED'
+    monkeypatch.setattr(store.time,'time',lambda:recovering['result']['retry_at']+1)
     fresh=store.claim('replacement')
     with pytest.raises(InterruptedError):store.update(job['id'],claim['lease'],state='READY')
     assert fresh['lease']!=claim['lease']
+
+
+def test_selection_stage_can_finish_blocked_without_becoming_failed(tmp_path, monkeypatch):
+    from factory.progress import Progress
+
+    monkeypatch.setattr(config, 'DATA', tmp_path)
+    monkeypatch.setattr(config, 'SCRATCH', tmp_path / 'scratch')
+    monkeypatch.setattr(config, 'DB', tmp_path / 'db')
+    job = store.create(req().model_dump())
+    claim = store.claim('worker')
+    progress = Progress(lambda state=None, **kwargs: store.update(job['id'], claim['lease'], state, **kwargs))
+    progress.begin('highlights', 'ANALYZING')
+    progress.done(status='blocked', message='No selected clips')
+    store.update(job['id'], claim['lease'], state='BLOCKED')
+    saved = store.get(job['id'])
+    assert saved['state'] == 'BLOCKED'
+    assert saved['stages'][0]['status'] == 'blocked'
+    assert saved['stages'][0]['finished'] is not None
+
+
+def test_transient_stage_retries_are_persisted_and_bounded(tmp_path,monkeypatch):
+    monkeypatch.setattr(config,'DATA',tmp_path)
+    monkeypatch.setattr(config,'SCRATCH',tmp_path/'scratch')
+    monkeypatch.setattr(config,'DB',tmp_path/'db')
+    now = 100
+    monkeypatch.setattr(store.time,'time',lambda:now)
+    job=store.create(req().model_dump())
+    failure={'code':'DOWNLOAD_RATE_LIMITED','stage':'retrieval','message':'rate limited','retryable':True}
+    for expected in ('QUEUED','QUEUED','FAILED'):
+        claim=store.claim('worker')
+        store.update(job['id'],claim['lease'],state='QUEUED',result={'failure':failure})
+        recovering=store.get(job['id'])
+        assert recovering['state']==expected
+        assert store.claim('worker') is None
+        now = recovering['result'].get('retry_at',now)+1
+    assert recovering['result']['failure']['attempt']==3
+
+
+def test_asr_interruption_reuses_completed_chunks_without_duplication(tmp_path, monkeypatch):
+    from factory import media, pipeline
+    from factory.progress import Progress
+
+    root = tmp_path / 'asr-job'
+    root.mkdir()
+    monkeypatch.setattr(config, 'AUDIO_CHUNK_SECONDS', 300)
+    downloaded_offsets = []
+    transcribed_offsets = []
+
+    def fake_download(source, out_path, start, end, res, audio_only, tick):
+        downloaded_offsets.append((start, end))
+        out_path.write_bytes(b'audio-chunk')
+
+    def fake_run(args, tick=None, duration=None, env=None):
+        out_json = args[4]
+        offset = int(out_json.split('transcript-')[1].split('.')[0])
+        if offset == 300 and len(transcribed_offsets) == 1:
+            transcribed_offsets.append('interrupted-300')
+            raise media.MediaFailure('PROCESSING_TIMEOUT', 'Injected ASR chunk 2 interruption', True)
+        transcribed_offsets.append(offset)
+        from pathlib import Path
+        Path(out_json).write_text(
+            json.dumps({
+                'language': 'en',
+                'segments': [{'start': 1.0, 'end': 10.0, 'text': f'Chunk at {offset}', 'words': [{'word': 'Chunk', 'start': 1.0, 'end': 2.0}]}],
+            }),
+            encoding='utf-8',
+        )
+
+    monkeypatch.setattr(media, 'download', fake_download)
+    monkeypatch.setattr(media, 'run', fake_run)
+    progress = Progress(lambda *a, **kw: None)
+
+    with pytest.raises(media.MediaFailure, match='Injected ASR chunk 2 interruption'):
+        pipeline.transcribe_chunks('https://example.com/v', req(start=0, end=600), root, {'has_audio': True}, 600, 720, progress, lambda **kw: None)
+
+    assert (root / 'transcript-0.json').is_file()
+    assert not (root / 'transcript-300.json').is_file()
+
+    # Resume after interruption: chunk 0 must NOT be re-downloaded or re-transcribed!
+    result = pipeline.transcribe_chunks('https://example.com/v', req(start=0, end=600), root, {'has_audio': True}, 600, 720, progress, lambda **kw: None)
+    assert transcribed_offsets == [0, 'interrupted-300', 300]
+    assert downloaded_offsets == [(0, 300), (300, 600), (300, 600)]
+    assert len(result['segments']) == 2
+    assert result['segments'][0]['start'] == 1.0 and result['segments'][1]['start'] == 301.0
+
+
+def test_cv_and_vlm_interruption_and_cache_version_invalidation(tmp_path, monkeypatch):
+    from factory import media
+    from factory.source_intelligence import analyze_source
+    from factory.vision_vlm import LocalVisionAdapter
+
+    # Build a small real MP4 fixture
+    video = tmp_path / 'cv_fixture.mp4'
+    media.run([
+        media.ffmpeg(), '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', 'color=c=navy:s=160x90:r=10',
+        '-t', '3', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(video),
+    ])
+
+    cache_dir = tmp_path / 'cache'
+    cache_dir.mkdir()
+    # Write a stale/corrupt v1 cache with old ocr_backend version or mismatched fingerprint
+    stale_cache = cache_dir / 'source-evidence-v1.json'
+    stale_cache.write_text(json.dumps({
+        'schema_version': 1,
+        'context': {
+            'source_id': str(video),
+            'source_fingerprint': 'stale-fingerprint',
+            'start': 0.0,
+            'end': 3.0,
+            'duration': 3.0,
+            'ocr_backend': 'opencv_text_band_fallback',
+        },
+        'shots': [],
+    }), encoding='utf-8')
+
+    # 1. Inject interruption during CV analysis
+    orig_extract = __import__('factory.source_intelligence', fromlist=['_extract_frame_features'])._extract_frame_features
+    calls = {'n': 0}
+    def interrupt_cv(rgb):
+        calls['n'] += 1
+        if calls['n'] == 2:
+            raise RuntimeError('Injected CV mid-pass interruption')
+        return orig_extract(rgb)
+
+    monkeypatch.setattr('factory.source_intelligence._extract_frame_features', interrupt_cv)
+    with pytest.raises(RuntimeError, match='Injected CV mid-pass interruption'):
+        analyze_source(video, 0.0, 3.0, {'segments': []}, cache_dir=cache_dir)
+
+    # Restore CV and verify stale cache is invalidated and replaced with valid evidence
+    monkeypatch.setattr('factory.source_intelligence._extract_frame_features', orig_extract)
+    ev = analyze_source(video, 0.0, 3.0, {'segments': []}, cache_dir=cache_dir)
+    assert ev.context.source_fingerprint != 'stale-fingerprint'
+    assert ev.context.ocr_backend.endswith(':v2')
+    assert len(ev.shots) >= 1
+
+    # 2. VLM interruption and cache-version invalidation check
+    vlm_cache = cache_dir / 'vlm-cache.json'
+    vlm_cache.write_text(json.dumps({'old_version_key': {'coherent_single_event': True}}), encoding='utf-8')
+    adapter = LocalVisionAdapter(model='qwen3-vl:2b-instruct', ollama_url='http://127.0.0.1:11434', cache_path=vlm_cache, max_calls=4, enabled=True)
+    adapter._available = True
+
+    vlm_net_calls = {'n': 0}
+    class InterruptingThenWorkingClient:
+        def __init__(self, *a, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def post(self, url, json):
+            vlm_net_calls['n'] += 1
+            if vlm_net_calls['n'] == 1:
+                raise httpx.ReadTimeout('Injected VLM timeout')
+            resp = __import__('unittest.mock').mock.MagicMock()
+            resp.status_code = 200
+            resp.raise_for_status = lambda: None
+            resp.json.return_value = {
+                'message': {
+                    'content': '{"is_format_break": false, "break_kind": "none", "reason": "Clean gameplay", "confidence": 0.90}'
+                }
+            }
+            return resp
+
+    monkeypatch.setattr('factory.vision_vlm.httpx.Client', InterruptingThenWorkingClient)
+    monkeypatch.setattr('factory.vision_vlm.vlm_gpu_layers', lambda m, u=None: 0)
+
+    # First call fails with timeout -> honest cv_fallback, NOT cached as valid result!
+    v_fail = adapter.detect_format_break([b'\xff\xd8frameA'], {'shot': 1})
+    assert v_fail.verified is False
+    assert adapter.failures == 1
+
+    # Retry succeeds and writes to cache
+    v_ok = adapter.detect_format_break([b'\xff\xd8frameA'], {'shot': 1})
+    assert v_ok.verified is True
+    assert vlm_net_calls['n'] == 2
+
+    # Subsequent call hits cache (0 new network calls)
+    v_cached = adapter.detect_format_break([b'\xff\xd8frameA'], {'shot': 1})
+    assert v_cached.verified is True
+    assert adapter.cache_hits == 1
+    assert vlm_net_calls['n'] == 2
+
+    # Changing PROMPT_VERSION invalidates old cache key and forces fresh inference
+    monkeypatch.setattr('factory.vision_vlm.PROMPT_VERSION', 'vlm-8.0-r4-test')
+    v_new_ver = adapter.detect_format_break([b'\xff\xd8frameA'], {'shot': 1})
+    assert v_new_ver.verified is True
+    assert vlm_net_calls['n'] == 3

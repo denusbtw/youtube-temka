@@ -15,6 +15,11 @@ import httpx
 CHUNK=8*1024*1024
 BASE='https://www.googleapis.com/drive/v3'
 
+class OAuthRefreshError(ValueError):
+    def __init__(self, status: str):
+        super().__init__('OAuth access could not be refreshed. Check authorization and connectivity.')
+        self.status = status
+
 
 def acknowledged(response):
     value=response.headers.get('Range')
@@ -53,11 +58,23 @@ class Drive:
             raise ValueError('Drive OAuth missing. Set DRIVE_TOKEN_FILE to the existing authorized-user JSON; mount it read-only. Existing credentials have not been changed.')
         self.secret=json.loads(Path(path).read_text(encoding='utf-8-sig'))
         self.client=httpx.Client(timeout=90,trust_env=False)
-        response=self.client.post('https://oauth2.googleapis.com/token',data={'client_id':self.secret['client_id'],'client_secret':self.secret['client_secret'],'refresh_token':self.secret['refresh_token'],'grant_type':'refresh_token'})
-        if response.status_code!=200:
+        try:
+            try:
+                response=self.client.post('https://oauth2.googleapis.com/token',data={'client_id':self.secret['client_id'],'client_secret':self.secret['client_secret'],'refresh_token':self.secret['refresh_token'],'grant_type':'refresh_token'})
+            except httpx.RequestError:
+                raise OAuthRefreshError('TOKEN_EXPIRED') from None
+            if response.status_code != 200:
+                try:
+                    error = response.json().get('error')
+                except (ValueError, AttributeError):
+                    error = None
+                status = ('REAUTHORIZATION_REQUIRED' if error in ('invalid_grant','invalid_client')
+                          else 'TOKEN_EXPIRED' if response.status_code == 429 or response.status_code >= 500 else 'ERROR')
+                raise OAuthRefreshError(status)
+            self.client.headers['Authorization'] = 'Bearer ' + response.json()['access_token']
+        except Exception:
             self.client.close()
-            raise ValueError('Drive authorization could not be refreshed. Reauthorize the existing OAuth client with Drive access in Settings.')
-        self.client.headers['Authorization']='Bearer '+response.json()['access_token']
+            raise
 
     def close(self):
         self.client.close()

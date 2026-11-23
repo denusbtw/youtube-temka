@@ -1,4 +1,4 @@
-"""Bounded, separately consented read-only YouTube analytics and recommendations."""
+"""Channel-bound, non-monetary YouTube analytics and recommendations."""
 from collections import defaultdict
 from datetime import date,datetime,timedelta,timezone
 import json
@@ -11,17 +11,22 @@ import time
 import httpx
 from . import store
 from .drive import Drive
+from . import youtube_channels as managed
 
 YT='https://www.googleapis.com/youtube/v3'
 REPORTS='https://youtubeanalytics.googleapis.com/v2/reports'
-SCOPES={'https://www.googleapis.com/auth/youtube.readonly','https://www.googleapis.com/auth/yt-analytics.readonly'}
+READONLY='https://www.googleapis.com/auth/youtube.readonly'
+SCOPES={READONLY,'https://www.googleapis.com/auth/yt-analytics.readonly'}
+PUBLISHING_FALLBACK_PROFILES={'leonida_mayhem'}
 METRICS=['views','estimatedMinutesWatched','averageViewDuration','averageViewPercentage','likes','comments','subscribersGained','subscribersLost']
+TOTAL_METRICS=['views','estimatedMinutesWatched','likes','comments','subscribersGained','subscribersLost']
 _lock=threading.Lock()
 
 
 def token_file(alias):
     if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}',alias):raise ValueError('Invalid Analytics credential alias')
-    path=Path(os.environ.get('YOUTUBE_ANALYTICS_TOKEN_DIR','secrets/analytics'))/(alias+'.json')
+    root = managed.directory(analytics=True) if alias in managed.PROFILES else Path(os.environ.get('YOUTUBE_ANALYTICS_TOKEN_DIR','secrets/analytics'))
+    path=root/(alias+'.json')
     if not path.is_file():raise ValueError('ANALYTICS_AUTH_REQUIRED: complete separate read-only consent')
     try:scopes=set(json.loads(path.read_text(encoding='utf-8-sig')).get('scopes',[]))
     except (OSError,ValueError):raise ValueError('Analytics credential is invalid; reconnect using a new alias') from None
@@ -33,15 +38,60 @@ def connections():
     with store.connect() as db:return [dict(row) for row in db.execute('SELECT * FROM analytics_connections')]
 
 
-def discover():
+def reporting_credential(alias, profile):
+    """Prefer dedicated consent. A malformed/revoked dedicated grant fails closed."""
+    dedicated = managed.directory(analytics=True)/(alias+'.json')
+    if (alias not in PUBLISHING_FALLBACK_PROFILES or dedicated.exists() or dedicated.is_symlink()
+        or not profile or profile['channel_key'] != alias):
+        return token_file(alias), 'dedicated_analytics'
+    if not profile['enabled'] or profile['status'] != 'CONNECTED' or not profile['channel_id']:
+        raise ValueError('ANALYTICS_AUTH_REQUIRED: verify the managed publishing channel first')
+    from .publisher import token_file as publishing_file
+    path = publishing_file(alias)
+    try:
+        record = json.loads(path.read_text(encoding='utf-8-sig'))
+        scopes = record.get('scopes')
+        if record.get('youtube_channel_id') != profile['channel_id'] or not isinstance(scopes,list) or READONLY not in scopes:
+            raise ValueError
+    except (OSError, ValueError, TypeError, AttributeError):
+        raise ValueError('The publishing credential must match the verified channel and include youtube.readonly') from None
+    return path, 'verified_publishing_readonly'
+
+
+def discover(profile_key=None):
     errors=[]
-    for path in Path(os.environ.get('YOUTUBE_ANALYTICS_TOKEN_DIR','secrets/analytics')).glob('*.json'):
+    legacy = (p for p in Path(os.environ.get('YOUTUBE_ANALYTICS_TOKEN_DIR','secrets/analytics')).glob('*.json') if p.stem not in managed.PROFILES)
+    profiles = {p['channel_key']:p for p in managed.profiles()}
+    keys = profiles if profile_key is None else (profile_key,)
+    files = [*(legacy if profile_key is None else ()),
+             *(managed.directory(analytics=True)/(key+'.json') for key in keys)]
+    for path in files:
+        profile = profiles.get(path.stem)
+        if profile and (not profile['enabled'] or (not path.is_file() and
+            (path.stem not in PUBLISHING_FALLBACK_PROFILES or not profile['channel_id']))):
+            continue
+        if profile and not path.is_file() and any(
+            row['channel']==profile['channel_id'] and row['alias']!=path.stem for row in connections()
+        ):
+            continue
         client=None
         try:
-            client=Drive(token_file(path.stem))
+            credential,_=reporting_credential(path.stem,profile)
+            client=Drive(credential)
             channels=client.request('GET',YT+'/channels',params={'part':'snippet','mine':'true'}).json().get('items',[])
+            if profile:
+                bound = json.loads(credential.read_text(encoding='utf-8-sig')).get('youtube_channel_id')
+                if not profile['channel_id'] or bound != profile['channel_id']:
+                    raise ValueError('Verify the corresponding publishing identity first.')
+                channels = [managed.identity(channels,path.stem,bound)]
             for channel in channels:
-                with store.connect() as db:db.execute("INSERT INTO analytics_connections(channel,alias,title) VALUES(?,?,?) ON CONFLICT(channel) DO UPDATE SET alias=excluded.alias,title=excluded.title,error=NULL,state='CONNECTED'",(channel['id'],path.stem,channel['snippet']['title']))
+                with store.connect() as db:
+                    db.execute("""INSERT INTO analytics_connections(channel,alias,title) VALUES(?,?,?)
+                        ON CONFLICT(channel) DO UPDATE SET alias=excluded.alias,title=excluded.title,error=NULL,
+                            state=CASE WHEN analytics_connections.state='READY' AND analytics_connections.alias=excluded.alias
+                                       THEN 'READY' ELSE 'CONNECTED' END
+                        WHERE analytics_connections.alias=excluded.alias OR ?""",
+                               (channel['id'],path.stem,channel['snippet']['title'],bool(profile)))
         except (ValueError,KeyError,OSError,httpx.HTTPError):errors.append({'alias':path.stem,'error':'Read-only Analytics authorization/channel lookup failed. Check consent and enabled APIs.'})
         finally:
             if client:client.close()
@@ -49,6 +99,12 @@ def discover():
 
 
 def _request(client,url,params):
+    if url == REPORTS:
+        metrics = set(params.get('metrics','').split(','))
+        if not metrics <= (set(METRICS) | {'engagedViews'}):
+            raise ValueError('Unsupported Analytics metric. Only approved non-monetary metrics are available.')
+    elif url not in {YT+'/channels',YT+'/playlistItems',YT+'/videos'}:
+        raise ValueError('Unsupported Analytics operation.')
     response=client.client.get(url,params=params)
     if response.status_code>=400:
         try:reason=response.json()['error']['errors'][0]['reason']
@@ -91,22 +147,34 @@ def _checkpoint(channel,**fields):
     with store.connect() as db:db.execute('UPDATE analytics_connections SET '+','.join(k+'=?' for k in fields)+' WHERE channel=?',(*fields.values(),channel))
 
 
-def _lineage(video):
+def _lineage(channel,video):
     with store.connect() as db:
-        row=db.execute('SELECT p.job,p.output,p.metadata,j.request,j.result FROM publications p JOIN jobs j ON j.id=p.job WHERE p.video_id=?',(video,)).fetchone()
+        row=db.execute('SELECT p.job,p.output,p.metadata,j.request,j.result FROM publications p JOIN jobs j ON j.id=p.job WHERE p.channel=? AND p.video_id=?',(channel,video)).fetchone()
         if not row:return None
         request=json.loads(row['request']);result=json.loads(row['result']);output=result.get('outputs',[])[row['output']]
-        return {'job':row['job'],'output':row['output'],'source':request['source'],'language':output.get('publishing_metadata',{}).get('audio_language') or result.get('language'),'metadata_language':output.get('publishing_metadata',{}).get('metadata_language'),'content_category':request.get('source_category'),'preset':request.get('preset'),'audio_mode':request.get('audio_mode','original'),'duration':output.get('duration'),'metadata_version':json.loads(row['metadata']).get('metadata_version')}
+        return {'job':row['job'],'output':row['output'],'source':request['source'],'language':output.get('publishing_metadata',{}).get('audio_language') or result.get('language'),'metadata_language':output.get('publishing_metadata',{}).get('metadata_language'),'content_category':request.get('source_category'),'preset':request.get('preset'),'audio_mode':request.get('audio_mode','original'),'duration':output.get('duration'),'metadata_version':json.loads(row['metadata']).get('metadata_version'),
+                'edit_configuration':output.get('edit_configuration')}
 
 
 def sync(channel):
     connection=next((c for c in connections() if c['channel']==channel),None)
     if not connection:raise ValueError('ANALYTICS_AUTH_REQUIRED: discover a separately authorized channel first')
+    profile = next((p for p in managed.profiles() if p['channel_id'] == channel), None)
+    if profile or connection['alias'] in managed.PROFILES:
+        if not profile or not profile['enabled'] or (
+            connection['alias'] in managed.PROFILES and connection['alias'] != profile['channel_key']
+        ):
+            raise ValueError('Enable the matching managed YouTube profile before syncing analytics.')
     _checkpoint(channel,state='SYNCING',last_attempt=time.time(),error=None,progress=0,total=None)
     client=None
     try:
-        client=Drive(token_file(connection['alias']))
+        credential, strategy=reporting_credential(connection['alias'],profile)
+        if connection['alias'] in managed.PROFILES and json.loads(credential.read_text(encoding='utf-8-sig')).get('youtube_channel_id') != channel:
+            raise ValueError('Analytics credential binding does not match the selected channel')
+        client=Drive(credential)
         channel_data=_request(client,YT+'/channels',{'part':'id,contentDetails','mine':'true'}).get('items',[])
+        if profile:
+            managed.identity(channel_data,profile['channel_key'],channel)
         identity=next((c for c in channel_data if c['id']==channel),None)
         if not identity:raise ValueError('Analytics token belongs to a different channel')
         ids=[]
@@ -117,9 +185,13 @@ def sync(channel):
         with store.connect() as db:ids+= [r['video_id'] for r in db.execute('SELECT video_id FROM publications WHERE channel=? AND video_id IS NOT NULL ORDER BY created DESC LIMIT 200',(channel,))]
         ids=list(dict.fromkeys(ids))[:250]
         today=datetime.now(timezone.utc).date();end=today-timedelta(days=2);start=end-timedelta(days=29)
-        common={'ids':'channel==MINE','startDate':start.isoformat(),'endDate':end.isoformat(),'metrics':','.join(METRICS)}
+        common={'ids':'channel=='+channel,'startDate':start.isoformat(),'endDate':end.isoformat(),'metrics':','.join(METRICS)}
         diagnostics=[]
         daily=metric_rows(client,{**common,'dimensions':'day','sort':'day'},diagnostics)
+        totals = None
+        if strategy == 'verified_publishing_readonly':
+            aggregate = _rows(_request(client, REPORTS, {**common,'metrics':','.join(TOTAL_METRICS)}))
+            totals = aggregate[0] if len(aggregate)==1 else None
         videos=[];_checkpoint(channel,total=len(ids))
         for offset in range(0,len(ids),50):
             batch=ids[offset:offset+50]
@@ -131,12 +203,14 @@ def sync(channel):
             for item in details:
                 snippet=item.get('snippet',{})
                 if snippet.get('channelId')!=channel:continue
-                lineage=_lineage(item['id']);seconds=duration_seconds(item.get('contentDetails',{}).get('duration'))
+                lineage=_lineage(channel,item['id']);seconds=duration_seconds(item.get('contentDetails',{}).get('duration'))
                 row={k:metrics.get(item['id'],{}).get(k) for k in METRICS}
                 row['engagedViews']=engaged.get(item['id'])
                 statistics=item.get('statistics',{})
                 video={'video_id':item['id'],'channel':channel,'title':snippet.get('title',''),'published_at':snippet.get('publishedAt'),'duration':seconds,'language':(lineage or {}).get('language') or snippet.get('defaultAudioLanguage') or 'und','category_id':snippet.get('categoryId'),'video_type':'unknown','lineage':lineage,'metrics':row,'lifetime_statistics':{key:int(statistics[key]) if key in statistics else None for key in ('viewCount','likeCount','commentCount')},'period':{'start':start.isoformat(),'end':end.isoformat()},'impressions':None,'ctr':None,'retention_curve':None}
                 # Duration alone cannot classify a platform Short. App mode is known.
+                video['privacy_status'] = item.get('status', {}).get('privacyStatus')
+                video['upload_status'] = item.get('status', {}).get('uploadStatus')
                 if lineage:
                     with store.connect() as db:
                         request=json.loads(db.execute('SELECT request FROM jobs WHERE id=?',(lineage['job'],)).fetchone()['request'])
@@ -144,7 +218,9 @@ def sync(channel):
                 else:video['video_type']='unknown'
                 videos.append(video)
             _checkpoint(channel,progress=min(offset+len(batch),len(ids)))
-        report={'period':{'start':start.isoformat(),'end':end.isoformat()},'daily':daily,'diagnostics':sorted(set(diagnostics)),'unavailable_metrics':['impressions','ctr','retention_curve'],'recent_video_limit':250,'recommendations':recommendations(videos)}
+        report={'period':{'start':start.isoformat(),'end':end.isoformat()},'daily':daily,'diagnostics':sorted(set(diagnostics)),'unavailable_metrics':['impressions','ctr','retention_curve'],'recent_video_limit':250,'recommendations':recommendations(videos),'experiments':experiment_comparisons(videos)}
+        if strategy == 'verified_publishing_readonly':
+            report.update(credential_strategy=strategy,totals=totals)
         with store.connect() as db:
             db.execute('DELETE FROM analytics_videos WHERE channel=?',(channel,))
             db.executemany('INSERT INTO analytics_videos VALUES(?,?,?,?)',[(channel,v['video_id'],json.dumps(v,ensure_ascii=False),time.time()) for v in videos])
@@ -156,6 +232,27 @@ def sync(channel):
         _checkpoint(channel,state='FAILED',error=safe[:300]);raise ValueError(safe) from None
     finally:
         if client:client.close()
+
+
+def experiment_comparisons(videos):
+    groups=defaultdict(list)
+    for video in videos:
+        edit=(video.get('lineage') or {}).get('edit_configuration') or {}
+        period=video.get('period') or {}
+        published=(video.get('published_at') or '')[:10]
+        parent=edit.get('experiment_parent')
+        variant=edit.get('experiment_variant')
+        if not parent or not variant or not published or published >= (period.get('start') or ''):
+            continue
+        metrics=video.get('metrics') or {}
+        if metrics.get('views') is None:
+            continue
+        key=(parent,video.get('channel'),period['start'],period['end'])
+        groups[key].append({'variant':variant,'title':video['title'],'video_id':video['video_id'],
+                            'duration':video['duration'],'metrics':metrics})
+    return [{'parent':parent,'start':start,'end':end,'variants':items}
+            for (parent,_,start,end),items in groups.items()
+            if len({item['variant'] for item in items})>=2]
 
 
 def recommendations(videos):

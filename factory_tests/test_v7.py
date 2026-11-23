@@ -70,10 +70,43 @@ def packages(count):
 @pytest.mark.parametrize('count,selected',[(49,0),(50,0),(51,1),(100,50)])
 def test_retention_counts_packages_and_selects_oldest_first(isolated,count,selected):
     packages(count)
+    retention.configure({'enabled':True})
     result=retention.cleanup(dry_run=True)
     assert len(result['selected'])==selected
     assert result['selected']==[f'{i+1:032x}' for i in range(selected)]
     assert result['deleted']==[]
+    assert result['over_limit']==0
+
+
+def test_retention_reports_when_protection_prevents_reaching_limit(isolated):
+    packages(51)
+    retention.configure({'enabled':True})
+    with store.connect() as db:db.execute('UPDATE retention_packages SET protected=1')
+    result=retention.cleanup(False)
+    assert result['selected']==[]
+    assert result['over_limit']==1
+
+
+def test_render_revisions_preserve_parent_approval_and_number_on_retry(isolated):
+    root=store.create({'source':'local fixture'})['id']
+    parent={'render_id':f'{root}:1','render_version':1,'approved':True,'approved_render_id':f'{root}:1'}
+    with store.connect() as db:
+        db.execute("UPDATE jobs SET state='READY',result=? WHERE id=?",(json.dumps({'outputs':[parent]}),root))
+    first=store.create({'source':f'edit:{root}:0'})
+    sibling=store.create({'source':f'edit:{root}:0'})
+    revision=first['result']['edit_revision']
+    assert revision=={'render_lineage_id':parent['render_id'],'parent_render_id':parent['render_id'],'render_version':2}
+    assert sibling['result']['edit_revision']['render_version']==3
+    with store.connect() as db:
+        db.execute("UPDATE jobs SET state='FAILED' WHERE id=?",(first['id'],))
+    assert store.retry(first['id'])
+    assert store.get(first['id'])['result']['edit_revision']==revision
+    derived_id=f"{first['id']}:1"
+    with store.connect() as db:
+        db.execute("UPDATE jobs SET state='READY',result=? WHERE id=?",(json.dumps({'outputs':[{**revision,'render_id':derived_id}]}),first['id']))
+    child=store.create({'source':f"edit:{first['id']}:0"})['result']['edit_revision']
+    assert child=={'render_lineage_id':parent['render_id'],'parent_render_id':derived_id,'render_version':4}
+    assert store.get(root)['result']['outputs']==[parent]
 
 
 @pytest.mark.parametrize('state',['SCHEDULED','FAILED','UNCERTAIN','PUBLISHING'])
@@ -96,9 +129,11 @@ def test_retention_protects_active_edit_sources_and_enforces_grace(isolated):
     assert not retention.candidates()[0]['eligible']
 
 
-def test_cleanup_failure_remains_retryable_and_blocks_new_edits(isolated,monkeypatch):
-    packages(1);jid=f'{1:032x}'
-    retention.configure({'enabled':True,'maximum_packages':50,'grace_days':7})
+@pytest.mark.parametrize('protect_during_verification',[False,True])
+def test_cleanup_failure_remains_retryable(isolated,monkeypatch,protect_during_verification):
+    packages(2);jid=f'{1:032x}'
+    retention.configure({'enabled':True,'maximum_packages':1,'grace_days':7})
+    retention.protect(f'{2:032x}',True)
     monkeypatch.setattr(retention,'token_file',lambda _:None)
     class Response:
         def __init__(self,data):self.data=data
@@ -109,13 +144,25 @@ def test_cleanup_failure_remains_retryable_and_blocks_new_edits(isolated,monkeyp
         def request(self,method,url,**kwargs):
             if url.endswith('/channels'):return Response({'items':[{'id':'channel'}]})
             if url.endswith('/videos'):return Response({'items':[{'snippet':{'channelId':'channel'},'status':{'privacyStatus':'public','uploadStatus':'processed'}}]})
-            if method=='PATCH':raise OSError('offline')
+            if method=='PATCH':
+                assert not protect_during_verification
+                with pytest.raises(ValueError,match='active package'):retention.protect(jid,True)
+                raise OSError('offline')
+            if protect_during_verification:retention.protect(jid,True)
             return Response({'size':'1','md5Checksum':'hash','appProperties':{'factoryKey':jid+'-clip.mp4'}})
     monkeypatch.setattr(retention,'Drive',Client)
     result=retention.cleanup(False)
     assert not result['deleted'] and len(result['errors'])==1
-    assert retention.candidates()[0]['state']=='DELETION_PENDING'
-    with pytest.raises(ValueError,match='expired'):store.create({'source':'edit:'+jid+':0'})
+    assert result['over_limit']==1
+    if protect_during_verification:
+        assert retention.candidates()[0]['state']=='ACTIVE'
+        assert retention.candidates()[0]['protected']
+        store.create({'source':'edit:'+jid+':0'})
+    else:
+        assert retention.candidates()[0]['state']=='DELETION_PENDING'
+        with pytest.raises(ValueError,match='expired'):store.create({'source':'edit:'+jid+':0'})
+        retention.configure({'enabled':True,'maximum_packages':50,'grace_days':7})
+        assert retention.cleanup(dry_run=True)['selected']==[jid]
 
 
 @pytest.mark.parametrize('language',['en','es','pt-BR','de','ru','uk'])

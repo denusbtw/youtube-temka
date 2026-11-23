@@ -33,7 +33,11 @@ def sweep(now=None):
                 result=json.loads(row['result'])
                 result['local_expired']=True
                 db.execute('UPDATE jobs SET result=? WHERE id=?',(json.dumps(result),row['id']))
-        referenced={json.loads(r['request'])['source'] for r in db.execute('SELECT request FROM jobs')}
+        referenced=set()
+        for row in db.execute('SELECT request FROM jobs'):
+            request=json.loads(row['request'])
+            referenced.add(request['source'])
+            referenced.update(item['source'] for item in request.get('sources',[]))
         for path in (config.SCRATCH/'uploads').glob('*'):
             if path.is_file() and not path.is_symlink() and 'upload:'+path.name not in referenced and path.stat().st_mtime<now-retention:
                 path.unlink()

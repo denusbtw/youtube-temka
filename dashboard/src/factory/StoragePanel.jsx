@@ -12,8 +12,8 @@ export default function StoragePanel({api,post,act}) {
     <button onClick={()=>act(async()=>{await post('/storage/retention/settings',data.settings);await refresh();})}>Зберегти політику</button>
     <button onClick={()=>act(async()=>setResult(await post('/storage/retention/run?dry_run=true')))}>Перевірити без видалення</button>
     <button disabled={!data.settings.enabled} onClick={()=>act(async()=>{if(!window.confirm('Перемістити лише перевірені придатні пакети в кошик Drive?'))return;setResult(await post('/storage/retention/run?dry_run=false'));await refresh();})}>Виконати очищення</button>
-    {result&&<p role="status">Вибрано: {result.selected.length}; видалено: {result.deleted.length}; помилок: {result.errors.length}. {result.dry_run?'Dry-run: файли не змінювалися.':''}</p>}
-    <details><summary>Пакети та захист ({data.packages.length})</summary>{data.packages.map(item=><p key={item.job}><code>{item.job.slice(0,12)}</code> · {item.state} · {item.eligible?'Придатний':item.reasons.join(', ')} <button onClick={()=>act(async()=>{await post(`/storage/retention/${item.job}/protect`,{approved:!item.protected});await refresh();})}>{item.protected?'Зняти захист':'Захистити'}</button></p>)}</details>
+    {result&&<p role="status">Вибрано {result.selected.length}. Видалено {result.deleted.length}. Помилок {result.errors.length}. {result.dry_run?'Прогноз пакетів понад ліміт':'Пакетів понад ліміт'} — {result.over_limit}.</p>}
+    <details><summary>Пакети та захист ({data.packages.length})</summary>{data.packages.map(item=><p key={item.job}><code>{item.job.slice(0,12)}</code> · {item.state} · {item.eligible?'Придатний':item.reasons.join(', ')} <button disabled={item.state!=='ACTIVE'} onClick={()=>act(async()=>{await post(`/storage/retention/${item.job}/protect`,{approved:!item.protected});await refresh();})}>{item.protected?'Зняти захист':'Захистити'}</button></p>)}</details>
     <details><summary>Історія очищення</summary>{data.history.map((item,i)=><p key={i}>{new Date(item.at*1000).toLocaleString()} · {item.job.slice(0,12)} · {item.state} · {item.detail}</p>)}</details>
   </section>;
 }

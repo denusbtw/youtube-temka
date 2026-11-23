@@ -196,7 +196,7 @@ try {
     $report=& docker @compose exec -T $service python -m factory.deployment readiness
     if ($LASTEXITCODE -ne 0) { throw 'Storage/integration readiness check failed.' }
     $report | Write-Host
-    Write-Host 'AI CONTENT FACTORY 7.0; Repository: denusbtw/youtube-temka; Docker Engine: READY'
+    Write-Host 'AI CONTENT FACTORY 7.2; Repository: denusbtw/youtube-temka; Docker Engine: READY'
     Write-Host ('Commit: '+(& git rev-parse HEAD))
     Write-Host "GPU runtime: $gpu (see actual CUDA Whisper probe above; full video acceptance separate)"
     if ($Status) { Write-Host 'Whisper inference: not repeated in read-only status mode.' } else { Write-Host 'Whisper: READY (model loaded and inference completed in an exited process)' }

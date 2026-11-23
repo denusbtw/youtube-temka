@@ -1,0 +1,11 @@
+# Test evidence
+- 7.2 baseline regression: 373 passed. 38 targeted tests and baseline CI passed.
+- Phase 1 ranking: 43 passed. Final local refinement and recovery slice: 30 passed.
+- Metadata: 17 passed. Geometry/API: 17 passed. Real-media targeted render slice: 5 passed, 20 deselected.
+- Jobs/assets/publisher: 49 passed after correcting the mount path for test-package imports. Combined safety slice: 74 passed after fixing the missing config import.
+- Real local 45 s GTA planning diagnostic: 23 coarse samples, 9.06 s under a 2 CPU / 3 GiB cap, 0/3 after fine inspection. Offline Ollama fallback used for this diagnostic. The original full source was not downloaded again.
+- Real manual GTA rerender: 169.8 s under a 2 CPU / 3 GiB cap, 45 s at 1080×1920, 1350 frames, 0/45 black samples, 13.3 ms audio/video end delta. Hook visually present at 0, 15, 30 and 44.9 s. Frames and MP4 remain in verification/runtime/quality-rebuild. Peak utilization was not measured.
+- Benchmark command: py verification/evaluate_quality.py docs/quality-rebuild/synthetic-annotations.json docs/quality-rebuild/synthetic-results.json
+- Full Linux regression command: py verification/check_v7_linux.py
+- Frontend build command from dashboard: npx --no-install vite build --config vite.factory.config.js
+- Browser smoke used the production image with a disposable dataset. Create, filtered Jobs, Editor including metadata fields, Library, Publish and Settings opened successfully. No production credentials were entered into that browser test.

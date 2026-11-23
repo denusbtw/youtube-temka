@@ -66,6 +66,15 @@ class TestGenerateSrt:
         assert "ich habe" in srt
         assert "ichhabe" not in srt
 
+    def test_discards_zero_duration_words_at_asr_boundaries(self, tmp_path):
+        out = tmp_path / "subs.srt"
+        words = [_w(" Context", 16.0, 16.4), _w(" Unaligned", 16.4, 16.4),
+                 _w(" Outcome", 17.0, 17.4)]
+        assert generate_srt(self._transcript(words), 16, 18, str(out), max_chars=8)
+        generated = out.read_text(encoding="utf-8-sig")
+        assert "Context" in generated and "Outcome" in generated
+        assert "Unaligned" not in generated
+
     def test_empty_range_returns_false(self, tmp_path):
         out = tmp_path / "subs.srt"
         words = [_w(" spaet", 50.0, 50.5)]

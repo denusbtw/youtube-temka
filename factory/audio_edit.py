@@ -52,7 +52,7 @@ def remove_pauses(source,output,transcript,start,end,has_audio,tick):
         manifest.write_text(''.join(f"file '{p.name}'\nduration {b-a:.9f}\n"
                                     for p,(a,b) in zip(parts,ranges)),encoding='utf-8')
         args=[ffmpeg(),'-hide_banner','-loglevel','error','-y','-f','concat','-safe','1',
-              '-i',str(manifest),'-map','0:v:0','-c:v','copy']
+                  '-i',manifest.name,'-map','0:v:0','-c:v','copy']
         args+=['-map','0:a:0','-c:a','aac'] if has_audio else ['-an']
-        run(args+['-threads','2',str(output)],tick)
+        run(args+['-threads','2',str(Path(output).resolve())],tick,cwd=work)
     return output,timed,caption_start,duration

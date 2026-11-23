@@ -11,8 +11,9 @@ import time
 import uuid
 from datetime import datetime,timezone,timedelta
 import httpx
-from . import store
-from .drive import Drive, BASE, CHUNK, acknowledged
+from . import config,store
+from .drive import Drive, OAuthRefreshError, BASE, CHUNK, acknowledged
+from . import youtube_channels as managed
 
 YT='https://www.googleapis.com/youtube/v3'
 
@@ -20,7 +21,8 @@ YT='https://www.googleapis.com/youtube/v3'
 def token_file(alias):
     if not re.fullmatch(r'[A-Za-z0-9_-]+',alias):
         raise ValueError('Invalid YouTube credential alias')
-    root=Path(os.environ.get('YOUTUBE_TOKEN_DIR','secrets/youtube')).resolve()
+    root=(managed.directory() if alias in managed.PROFILES else
+          Path(os.environ.get('YOUTUBE_TOKEN_DIR','secrets/youtube'))).resolve()
     path=root/(alias+'.json')
     if not path.is_file():
         raise ValueError('YouTube OAuth missing. Mount the existing authorized-user JSON in YOUTUBE_TOKEN_DIR.')
@@ -31,7 +33,7 @@ def discover_channels():
     root=Path(os.environ.get('YOUTUBE_TOKEN_DIR','secrets/youtube'))
     errors=[]
     for path in root.glob('*.json'):
-        if not re.fullmatch(r'[A-Za-z0-9_-]+',path.stem):
+        if path.stem in managed.PROFILES or not re.fullmatch(r'[A-Za-z0-9_-]+',path.stem):
             continue
         client=None
         try:
@@ -39,24 +41,30 @@ def discover_channels():
             response=client.request('GET',YT+'/channels',params={'part':'snippet','mine':'true'})
             for channel in response.json()['items']:
                 with store.connect() as db:
-                    db.execute('INSERT INTO channels(id,alias,title) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET alias=excluded.alias,title=excluded.title',(channel['id'],path.stem,channel['snippet']['title']))
+                    db.execute('INSERT INTO channels(id,alias,title) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title WHERE channels.alias=excluded.alias',(channel['id'],path.stem,channel['snippet']['title']))
         except Exception:
             errors.append({'alias':path.stem,'error':'Authorization/channel lookup failed. Check OAuth scopes, API access and token validity.'})
         finally:
             if client:
                 client.close()
-    return {'channels':channels(),'errors':errors}
+    for key in managed.PROFILES:
+        managed.discover(key)
+    return {'channels':channels(),'profiles':managed.profiles(),'errors':errors}
 
 
 def channels():
+    profiles={p['channel_id']:p for p in managed.profiles() if p['channel_id']}
     with store.connect() as db:
-        return [{**dict(row),'preferences':store.preferences(row['id'])} for row in db.execute('SELECT c.*,coalesce(s.interval_minutes,120) interval_minutes FROM channels c LEFT JOIN channel_schedules s ON s.channel=c.id')]
+        return [{**dict(row),'preferences':store.preferences(row['id']),'managed_profile':profiles.get(row['id'])}
+                for row in db.execute('SELECT c.*,coalesce(s.interval_minutes,120) interval_minutes FROM channels c LEFT JOIN channel_schedules s ON s.channel=c.id')]
 
 
 def set_policy(channel,daily_limit,public_allowed,automatic,interval_minutes=120,preferences=None):
     if automatic and not public_allowed:
         raise ValueError('Automatic publishing requires explicit public publishing authorization for this channel')
     with store.connect() as db:
+        if (public_allowed or automatic) and db.execute('SELECT 1 FROM youtube_profiles WHERE channel_id=?',(channel,)).fetchone():
+            raise ValueError('Managed YouTube channels accept manually approved private uploads only.')
         if not db.execute('UPDATE channels SET daily_limit=?,public_allowed=?,automatic=? WHERE id=?',(daily_limit,public_allowed,automatic,channel)).rowcount:
             raise ValueError('Connect this authorized channel first')
         db.execute('INSERT OR REPLACE INTO channel_schedules VALUES(?,?)',(channel,interval_minutes))
@@ -127,6 +135,8 @@ def edit(pid,title,description,privacy='private',publish_at=None):
         if not row or row['state'] not in ('QUEUED','FAILED') or row['session'] or row['video_id']:
             raise ValueError('Only queued/failed items without an upload session or video ID can be edited')
         policy=db.execute('SELECT * FROM channels WHERE id=?',(row['channel'],)).fetchone()
+        if managed.require_ready(row['channel'], db) and (privacy != 'private' or publish_at):
+            raise ValueError('Managed YouTube channels accept private uploads only.')
         if not policy or ((privacy=='public' or publish_at) and not policy['public_allowed']):
             raise ValueError('Public publishing has not been explicitly enabled for this channel')
         metadata=json.loads(row['metadata'])
@@ -145,9 +155,13 @@ def edit(pid,title,description,privacy='private',publish_at=None):
 
 
 def enqueue(jid,index,channel,title=None,description=None,privacy='private',publish_at=None,automatic=False):
+    if automatic and not config.AUTOMATIC_PUBLISHING:
+        raise ValueError('Automatic publishing is disabled; approve this exact render and metadata manually')
     job=store.get(jid)
     if not job or job['state']!='READY' or index<0:
         raise ValueError('Only READY outputs can be queued')
+    if job['request'].get('publish_channel') not in (None, channel):
+        raise ValueError('The job is bound to a different YouTube channel.')
     try:
         output=job['result']['outputs'][index]
     except (KeyError,IndexError):
@@ -179,9 +193,17 @@ def enqueue(jid,index,channel,title=None,description=None,privacy='private',publ
         current=db.execute('SELECT state,result FROM jobs WHERE id=?',(jid,)).fetchone()
         if not current or current['state']!='READY' or json.loads(current['result'])['outputs'][index]!=output:
             raise ValueError('Output or approval changed while queueing; refresh and review the current revision')
+        package=db.execute('SELECT state FROM retention_packages WHERE job=?',(jid,)).fetchone()
+        if package and package['state'] in ('DELETION_PENDING','DELETED'):
+            raise ValueError('The Drive package is being removed or has expired')
         policy=db.execute('SELECT * FROM channels WHERE id=?',(channel,)).fetchone()
         if not policy:
             raise ValueError('Select an authenticated YouTube channel')
+        key = managed.require_ready(channel, db)
+        if job['request'].get('youtube_channel_key') not in (None, key):
+            raise ValueError('The job is bound to a different YouTube profile.')
+        if key and (privacy != 'private' or publish_at or automatic):
+            raise ValueError('Managed YouTube channels accept manually approved private uploads only.')
         if (privacy=='public' or publish_at) and not policy['public_allowed']:
             raise ValueError('Public publishing has not been explicitly enabled for this channel')
         if automatic and not policy['automatic']:
@@ -202,7 +224,7 @@ def enqueue(jid,index,channel,title=None,description=None,privacy='private',publ
             next_time=schedule(db,channel,datetime.now(timezone.utc)+timedelta(hours=2),policy['daily_limit'],minutes,store.preferences(channel).get('timezone','UTC'),exclude=prior['id'] if prior else None)
             status={'privacyStatus':'private','publishAt':next_time.isoformat(),'selfDeclaredMadeForKids':False}
         pid=uuid.uuid4().hex
-        metadata={'snippet':snippet,'status':status,'drive':output['drive'],'automatic':automatic,'metadata_version':draft.get('version') if draft else None,'thumbnail':output.get('thumbnail'),'format':job['request'].get('mode','shorts'),'strict_metadata':bool(draft)}
+        metadata={'snippet':snippet,'status':status,'drive':output['drive'],'automatic':automatic,'metadata_version':draft.get('version') if draft else None,'thumbnail':output.get('thumbnail'),'format':job['request'].get('mode','shorts'),'strict_metadata':bool(draft),'channel_key':key}
         if prior:
             db.execute("UPDATE publications SET state='QUEUED',metadata=?,error=NULL WHERE id=? AND state='DRAFT' AND session IS NULL AND video_id IS NULL",(json.dumps(metadata,ensure_ascii=False),prior['id']))
             return prior['id']
@@ -217,6 +239,10 @@ def claim():
         # A process can resume only the saved session, never insert a second video.
         db.execute("UPDATE publications SET state=CASE WHEN session IS NULL THEN 'FAILED' ELSE 'RETRYING' END,error='Publisher restarted; retry the saved session',seen=? WHERE state='PUBLISHING' AND seen<?",(now,now-180))
         for row in db.execute("SELECT p.*,c.alias,c.daily_limit FROM publications p JOIN channels c ON c.id=p.channel WHERE p.state='QUEUED' OR (p.state='RETRYING' AND (p.seen IS NULL OR p.seen<?)) ORDER BY p.created",(now-30,)).fetchall():
+            try:
+                managed.require_ready(row['channel'], db)
+            except ValueError:
+                continue
             from zoneinfo import ZoneInfo
             local=datetime.fromtimestamp(now,timezone.utc).astimezone(ZoneInfo(store.preferences(row['channel']).get('timezone','UTC')))
             day=local.replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
@@ -296,11 +322,26 @@ def upload(publication):
     pid=publication['id']
     youtube=None
     drive=None
+    key=None
     try:
         job=store.get(publication['job'])
         if not job or job['state']!='READY':raise ValueError('Publication source is no longer ready')
         current=job['result']['outputs'][publication['output']]
         queued=json.loads(publication['metadata'])
+        if job['request'].get('publish_channel') not in (None, publication['channel']):
+            raise PublicationError('Job target does not match the stored publication channel.')
+        with store.connect() as db:
+            key = managed.require_ready(publication['channel'], db)
+            binding = db.execute('SELECT alias FROM channels WHERE id=?',(publication['channel'],)).fetchone()
+        if job['request'].get('youtube_channel_key') not in (None, key):
+            raise PublicationError('Job profile does not match the stored publication channel.')
+        if key and (not binding or publication['alias'] != binding['alias'] or queued.get('channel_key') != key or
+                    queued['status']['privacyStatus'] != 'private' or queued['status'].get('publishAt') or queued.get('automatic')):
+            raise PublicationError('Managed publishing requires its original channel binding and private visibility.')
+        if queued.get('automatic') and not config.AUTOMATIC_PUBLISHING:
+            if publication.get('session'):
+                raise Uncertain('Automatic publishing is disabled; reconcile the existing upload session manually')
+            raise ValueError('Automatic publishing is disabled; nothing uploaded')
         if not current.get('approved'):
             if not queued.get('automatic') or needs_editorial_review(job,publication['output']) or not store.preferences(publication['channel']).get('auto_approve'):
                 raise ValueError('Editorial approval was withdrawn; nothing uploaded')
@@ -308,13 +349,19 @@ def upload(publication):
         if queued.get('metadata_version') and current.get('publishing_metadata',{}).get('version')!=queued['metadata_version']:raise ValueError('Metadata version changed; nothing uploaded')
         youtube=Drive(token_file(publication['alias']))
         authorized=youtube.request('GET',YT+'/channels',params={'part':'id','mine':'true'}).json()['items']
-        if publication['channel'] not in [c['id'] for c in authorized]:
+        if key:
+            try:
+                managed.identity(authorized,key,publication['channel'])
+            except ValueError as error:
+                managed.record_status(key,'ERROR','OAuth identifies a different channel. Reconnect the intended identity.')
+                raise PublicationError(str(error)) from None
+        elif publication['channel'] not in [c['id'] for c in authorized]:
             raise ValueError('OAuth token is authorized for a different channel; nothing uploaded')
         drive=Drive()
         body=json.loads(publication['metadata'])
         remote=body.pop('drive')
         automatic=body.pop('automatic',False)
-        internal={k:body.pop(k,None) for k in ('metadata_version','thumbnail','format','strict_metadata')}
+        internal={k:body.pop(k,None) for k in ('metadata_version','thumbnail','format','strict_metadata','channel_key')}
         with store.connect() as db:
             policy=db.execute('SELECT * FROM channels WHERE id=?',(publication['channel'],)).fetchone()
             if not policy or ((body['status']['privacyStatus']=='public' or body['status'].get('publishAt')) and not policy['public_allowed']) or (automatic and not policy['automatic']):
@@ -399,6 +446,10 @@ def upload(publication):
         checkpoint(pid,state='UNCERTAIN',error=str(error))
     except PublicationError as error:
         checkpoint(pid,state='FAILED',error=str(error))
+    except OAuthRefreshError as error:
+        if key and youtube is None:
+            managed.record_status(key,error.status,'Verify or reconnect this YouTube authorization before retrying.')
+        checkpoint(pid,state='FAILED',error=str(error))
     except (httpx.HTTPError,ValueError,KeyError,OSError):
         # A retry will query the persisted session first, including after final PUT timeout.
         checkpoint(pid,state='FAILED',error='Upload interrupted or authorization/quota validation failed. Retry resumes the saved session; check channel authorization and Drive access.')
@@ -416,7 +467,9 @@ def complete(pid,response,metadata,youtube,channel):
     # erase knowledge of a remotely created video.
     checkpoint(pid,video_id=response['id'])
     remote=youtube.request('GET',YT+'/videos',params={'part':'snippet,status','id':response['id']}).json()['items']
-    if not remote or remote[0]['snippet']['channelId']!=channel or remote[0]['status']['privacyStatus']!=metadata['status']['privacyStatus']:
+    if (not remote or remote[0].get('id',response['id']) != response['id']
+        or remote[0]['snippet']['channelId'] != channel
+        or remote[0]['status']['privacyStatus'] != metadata['status']['privacyStatus']):
         raise Uncertain('Video ID exists but channel/privacy verification failed; inspect YouTube Studio')
     if remote[0]['status'].get('uploadStatus') not in ('uploaded','processed'):
         raise Uncertain('Video ID exists but YouTube did not confirm a successful upload status; inspect YouTube Studio')
@@ -482,6 +535,7 @@ def refresh_scheduled(now=None):
 
 def auto_queue():
     """Reconcile READY automatic jobs after restarts; enqueue remains idempotent."""
+    if not config.AUTOMATIC_PUBLISHING:return
     for job in store.list_jobs():
         if job['state']!='READY' or not job['request'].get('publish_automatic'):
             continue

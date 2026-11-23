@@ -74,7 +74,71 @@ def test_unsupported_metric_does_not_hide_supported_report_columns():
     class Client:pass
     client=Client();client.client=httpx.Client(transport=httpx.MockTransport(handler))
     diagnostics=[]
-    try:rows=analytics.metric_rows(client,{'dimensions':'day','metrics':'views,unavailableMetric'},diagnostics)
+    try:rows=analytics.metric_rows(client,{'dimensions':'day','metrics':'views,averageViewDuration'},diagnostics)
     finally:client.client.close()
     assert rows==[{'day':'2026-11-01','views':12}]
-    assert 'unavailableMetric' not in rows[0] and diagnostics
+    assert 'averageViewDuration' not in rows[0] and diagnostics
+
+
+@pytest.mark.parametrize('dedicated',[False,True])
+def test_managed_reporting_preference_and_channel_isolation(isolated,monkeypatch,dedicated):
+    key='leonida_mayhem'
+    channel='leonida-fixture'
+    publish=isolated/'publish'
+    separate=isolated/'separate'
+    monkeypatch.setenv('FACTORY_MANAGED_YOUTUBE_DIR',str(publish))
+    monkeypatch.setenv('FACTORY_MANAGED_ANALYTICS_DIR',str(separate))
+    publish.mkdir()
+    separate.mkdir()
+    fallback=publish/(key+'.json')
+    preferred=separate/(key+'.json')
+    fallback.write_text(json.dumps({'youtube_channel_id':channel,'scopes':[analytics.READONLY]}))
+    if dedicated:preferred.write_text(json.dumps({'youtube_channel_id':channel,'scopes':list(analytics.SCOPES)}))
+    with store.connect() as db:
+        db.execute("UPDATE youtube_profiles SET channel_id=?,status='CONNECTED' WHERE channel_key=?",(channel,key))
+        db.execute("INSERT INTO analytics_reports VALUES(?,?,?)",('vice-fixture','{}',123))
+    calls=[]
+    remote_id=channel
+    fail_refresh=False
+    def handler(request):
+        calls.append(request)
+        if request.url.path.endswith('/channels'):
+            return httpx.Response(200,json={'items':[{'id':remote_id,'snippet':{'title':'Leonida Mayhem'}}]})
+        assert request.method=='GET' and request.url.params['ids']=='channel=='+channel
+        columns=[{'name':m} for m in request.url.params['metrics'].split(',')]
+        daily='dimensions' in request.url.params
+        return httpx.Response(200,json={'columnHeaders':([{'name':'day'}] if daily else [])+columns,
+                                        'rows':[] if daily else [[0]*len(columns)]})
+    class Client:
+        def __init__(self,path):
+            assert path==(preferred if dedicated else fallback)
+            if fail_refresh: raise ValueError('Refresh failed')
+            self.client=httpx.Client(transport=httpx.MockTransport(handler))
+        def request(self,*a,**kw): return self.client.request(*a,**kw)
+        def close(self):self.client.close()
+    monkeypatch.setattr(analytics,'Drive',Client)
+    assert not analytics.discover()['errors']
+    report=analytics.sync(channel)['channels'][0]['report']
+    assert report['daily']==[]
+    if not dedicated:
+        assert report['totals']['views']==0
+        assert report['credential_strategy']=='verified_publishing_readonly'
+    remote_id='vice-fixture'
+    calls.clear()
+    with pytest.raises(ValueError,match='different channel'):analytics.sync(channel)
+    assert len(calls)==1 and calls[0].url.path.endswith('/channels')
+    fail_refresh=True
+    with pytest.raises(ValueError,match='Refresh failed'):analytics.sync(channel)
+    assert analytics.snapshot(channel)['channels'][0]['report']==report
+    with store.connect() as db:
+        assert db.execute("SELECT seen FROM analytics_reports WHERE channel='vice-fixture'").fetchone()[0]==123
+    if not dedicated:
+        fallback.write_text(json.dumps({'youtube_channel_id':channel,'scopes':['https://www.googleapis.com/auth/youtube.upload']}))
+        with pytest.raises(ValueError,match='youtube.readonly'):analytics.sync(channel)
+
+
+def test_reporting_blocks_monetary_metrics_and_out_of_scope_endpoints():
+    with pytest.raises(ValueError,match='non-monetary'):
+        analytics._request(None,analytics.REPORTS,{'metrics':'estimatedRevenue'})
+    with pytest.raises(ValueError,match='Unsupported Analytics operation'):
+        analytics._request(None,'https://youtubeanalytics.googleapis.com/v2/groups',{})
